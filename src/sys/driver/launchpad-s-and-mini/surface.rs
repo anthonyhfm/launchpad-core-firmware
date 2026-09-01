@@ -359,16 +359,7 @@ fn key_to_index(key: usize) -> u8 {
 
 fn index_to_key(index: u8) -> usize {
     match index {
-        11..=89 => {
-            let row = (index / 10).saturating_sub(1) as usize;
-            let col = (index % 10).saturating_sub(1) as usize;
-            if row < 8 && col < 9 {
-                let mirrored_row = 7 - row;
-                mirrored_row * 9 + col
-            } else {
-                RED_MAP.len()
-            }
-        }
+        11..=89 if index % 10 != 0 => (8 - index as usize / 10) * 9 + (index as usize % 10 - 1),
         91..=98 => 72 + (index - 91) as usize,
         99 => 80,
         _ => RED_MAP.len(),
