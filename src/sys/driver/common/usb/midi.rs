@@ -36,41 +36,52 @@ impl SysexMessage {
 }
 
 pub struct SysexReceiver {
-    pub buf: [u8; SYSEX_MAX_LEN],
-    pub len: usize,
-    pub port: MidiPort,
+    buf: [[u8; SYSEX_MAX_LEN]; 3],
+    len: [usize; 3],
+    active: [bool; 3],
 }
 
 impl SysexReceiver {
     pub const fn new() -> Self {
         Self {
-            buf: [0; SYSEX_MAX_LEN],
-            len: 0,
-            port: MidiPort::Daw,
+            buf: [[0; SYSEX_MAX_LEN]; 3],
+            len: [0; 3],
+            active: [false; 3],
         }
     }
 
-    pub fn append(&mut self, bytes: &[u8]) {
-        let space = SYSEX_MAX_LEN.saturating_sub(self.len);
-        let to_copy = bytes.len().min(space);
-        self.buf[self.len..self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
-        self.len += to_copy;
-    }
-
-    pub fn take(&mut self) -> Option<SysexMessage> {
-        if self.len == 0 {
-            return None;
+    fn receive(&mut self, port: MidiPort, bytes: &[u8]) -> Option<SysexMessage> {
+        let cable = port as usize;
+        for &byte in bytes {
+            if byte >= 0xf8 {
+                continue;
+            }
+            if byte == 0xf0 {
+                self.len[cable] = 0;
+                self.active[cable] = true;
+            }
+            if !self.active[cable] {
+                continue;
+            }
+            if self.len[cable] == SYSEX_MAX_LEN || (byte >= 0x80 && byte != 0xf0 && byte != 0xf7) {
+                self.active[cable] = false;
+                self.len[cable] = 0;
+                continue;
+            }
+            self.buf[cable][self.len[cable]] = byte;
+            self.len[cable] += 1;
+            if byte == 0xf7 {
+                let msg = SysexMessage {
+                    port,
+                    len: self.len[cable],
+                    data: self.buf[cable],
+                };
+                self.active[cable] = false;
+                self.len[cable] = 0;
+                return Some(msg);
+            }
         }
-
-        let mut data = [0u8; SYSEX_MAX_LEN];
-        data[..self.len].copy_from_slice(&self.buf[..self.len]);
-        let msg = SysexMessage {
-            port: self.port,
-            len: self.len,
-            data,
-        };
-        self.len = 0;
-        Some(msg)
+        None
     }
 }
 
@@ -89,32 +100,18 @@ pub fn parse_usb_midi_packet(
     let port = match cable {
         0 => MidiPort::Daw,
         1 => MidiPort::Midi,
-        _ => MidiPort::Din,
+        2 => MidiPort::Din,
+        _ => return,
     };
 
     match cin {
-        0x4 => {
-            sysex_rx.port = port;
-            sysex_rx.append(&packet[1..4]);
-        }
-        0x5 => {
-            sysex_rx.port = port;
-            sysex_rx.append(&packet[1..2]);
-            if let Some(msg) = sysex_rx.take() {
-                let _ = push_sysex(msg);
-            }
-        }
-        0x6 => {
-            sysex_rx.port = port;
-            sysex_rx.append(&packet[1..3]);
-            if let Some(msg) = sysex_rx.take() {
-                let _ = push_sysex(msg);
-            }
-        }
-        0x7 => {
-            sysex_rx.port = port;
-            sysex_rx.append(&packet[1..4]);
-            if let Some(msg) = sysex_rx.take() {
+        0x4..=0x7 => {
+            let count = match cin {
+                0x5 => 1,
+                0x6 => 2,
+                _ => 3,
+            };
+            if let Some(msg) = sysex_rx.receive(port, &packet[1..1 + count]) {
                 let _ = push_sysex(msg);
             }
         }
@@ -176,11 +173,7 @@ pub fn encode_usb_midi_packets(
     Ok(1)
 }
 
-fn encode_sysex_packets(
-    cable: u8,
-    data: &[u8],
-    out: &mut [UsbMidiPacket],
-) -> Result<usize, ()> {
+fn encode_sysex_packets(cable: u8, data: &[u8], out: &mut [UsbMidiPacket]) -> Result<usize, ()> {
     let mut src = 0usize;
     let mut dst = 0usize;
 

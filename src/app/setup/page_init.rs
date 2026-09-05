@@ -11,7 +11,8 @@ use crate::sys::led;
 use crate::sys::settings;
 
 const PERFORMANCE_BUTTON: u8 = 11;
-const PROGRAMMER_BUTTON: u8 = 12;
+const PROGRAMMER_BUTTON: u8 = 13;
+const DAW_BUTTON: u8 = 12;
 const PALETTE_RAINBOW_BUTTON: u8 = 25;
 const CUSTOM_PALETTE_START: u8 = 26;
 const SYSTEM_PALETTE_START: u8 = 15;
@@ -47,7 +48,7 @@ impl InitPage {
     }
 
     pub fn set_current_mode(&mut self, app: AppId) {
-        if matches!(app, AppId::Performance | AppId::Programmer) {
+        if matches!(app, AppId::Performance | AppId::Programmer | AppId::Daw) {
             self.current_mode = app;
             self.selected_mode = None;
         }
@@ -67,6 +68,14 @@ impl InitPage {
 
     fn draw_mode_selector(&self) {
         let mode = self.active_mode();
+        led::set(
+            DAW_BUTTON,
+            if mode == AppId::Daw {
+                0x00ff00
+            } else {
+                0x004000
+            },
+        );
 
         led::set(
             PERFORMANCE_BUTTON,
@@ -161,6 +170,10 @@ impl Page for InitPage {
         }
 
         match event.index {
+            DAW_BUTTON => {
+                self.selected_mode = Some(AppId::Daw);
+                self.draw_mode_selector();
+            }
             PERFORMANCE_BUTTON => {
                 self.selected_mode = Some(AppId::Performance);
                 self.draw_mode_selector();

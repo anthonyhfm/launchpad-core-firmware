@@ -2,6 +2,7 @@
 // Copyright (C) 2025-2026 Anthony Hofmeister
 
 use crate::app::boot::BootApp;
+use crate::app::daw::DawApp;
 use crate::app::palette_editor::PaletteEditorApp;
 use crate::app::performance::PerformanceApp;
 use crate::app::programmer::ProgrammerApp;
@@ -27,6 +28,8 @@ pub struct AppHost {
     setup: SetupApp,
     performance: PerformanceApp,
     programmer: ProgrammerApp,
+    daw: DawApp,
+    pending_host_switch: Option<AppId>,
     palette_editor: PaletteEditorApp,
     #[cfg(feature = "no-setup-btn")]
     setup_hold_ticks: u16,
@@ -46,6 +49,8 @@ impl AppHost {
             setup: SetupApp::new(),
             performance: PerformanceApp::new(),
             programmer: ProgrammerApp::new(),
+            daw: DawApp::new(),
+            pending_host_switch: None,
             palette_editor: PaletteEditorApp::new(),
             previous_app: current,
             #[cfg(feature = "no-setup-btn")]
@@ -65,6 +70,7 @@ impl AppHost {
             AppId::Setup => &mut self.setup,
             AppId::Performance => &mut self.performance,
             AppId::Programmer => &mut self.programmer,
+            AppId::Daw => &mut self.daw,
             AppId::PaletteEditor => &mut self.palette_editor,
         }
     }
@@ -120,9 +126,11 @@ impl AppHost {
         self.apply_requested_app_switch();
     }
 
-    // Only rotates the main grid in setup mode, every other app rotates.
+    // DAW follows physical labels; Setup rotates only its main grid.
     fn to_canonical_index(&self, raw_index: u8) -> u8 {
-        if self.current == AppId::Setup {
+        if self.current == AppId::Daw {
+            raw_index
+        } else if self.current == AppId::Setup {
             rotation::to_canonical_grid_only(raw_index)
         } else {
             rotation::to_canonical(raw_index)
@@ -132,6 +140,14 @@ impl AppHost {
     #[inline(never)]
     pub fn route_midi_event(&mut self, event: MidiEvent) {
         if event.port == MidiPort::Daw {
+            if self.current == AppId::Daw && Self::handle_led_tempo_event(&event) {
+                return;
+            }
+            self.daw.receive_midi(event);
+            return;
+        }
+
+        if self.current == AppId::Daw {
             return;
         }
 
@@ -155,17 +171,39 @@ impl AppHost {
     #[inline(never)]
     pub fn receive_sysex(&mut self, port: MidiPort, data: &[u8]) {
         if port == MidiPort::Daw {
+            if sysex::device_inquiry::execute(self.current, port, data)
+                || sysex::version_inquiry::execute(self.current, port, data)
+            {
+                return;
+            }
+            let (_, requested) = self.daw.receive_sysex_for_app(data, self.current);
+            if let Some(app) = requested {
+                self.request_host_switch(app);
+            }
             return;
         }
 
-        if self.current != AppId::Boot {
-            if let Some(app) = modes::switch_target(data) {
-                self.switch(app);
-                return;
+        if port == MidiPort::Midi && modes::is_selection(self.daw.model(), data) {
+            let (_, requested) = self.daw.receive_sysex_for_app(data, self.current);
+            if let Some(app) = requested {
+                self.request_host_switch(app);
             }
+            return;
         }
 
         sysex::execute(self.current, port, data);
+    }
+
+    // Defer host requests until Boot or Setup finishes; the latest request wins.
+    fn request_host_switch(&mut self, app: AppId) {
+        if matches!(
+            self.current,
+            AppId::Boot | AppId::Setup | AppId::PaletteEditor
+        ) {
+            self.pending_host_switch = Some(app);
+        } else {
+            self.switch(app);
+        }
     }
 
     #[inline(never)]
@@ -183,6 +221,11 @@ impl AppHost {
 
     fn apply_requested_app_switch(&mut self) {
         if let Some(app) = self.active_app_mut().take_requested_app_switch() {
+            let app = if self.current == AppId::Boot {
+                self.pending_host_switch.take().unwrap_or(app)
+            } else {
+                app
+            };
             self.switch(app);
         }
     }
@@ -206,7 +249,9 @@ impl AppHost {
     }
 
     fn exit_setup(&mut self) {
-        let app = self.setup.finish_setup().unwrap_or(self.previous_app);
+        let selected = self.setup.finish_setup();
+        let pending = self.pending_host_switch.take();
+        let app = selected.or(pending).unwrap_or(self.previous_app);
         self.switch(app);
     }
 

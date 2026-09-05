@@ -64,6 +64,13 @@ fn main() -> ! {
             }
         }
 
+        while let Some(message) = usb::dequeue_sysex_message() {
+            unsafe {
+                (&mut *core::ptr::addr_of_mut!(APP_HOST))
+                    .receive_sysex(message.port, &message.data[..message.len]);
+            }
+        }
+
         cortex_m::interrupt::free(|_| unsafe {
             while let Some(event) = (&mut *core::ptr::addr_of_mut!(SURFACE)).poll_event() {
                 let event = match event {

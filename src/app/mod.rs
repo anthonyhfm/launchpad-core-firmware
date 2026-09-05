@@ -3,6 +3,7 @@
 
 pub mod apptrait;
 pub mod boot;
+pub mod daw;
 pub mod events;
 pub mod host;
 pub mod palette_editor;
@@ -22,6 +23,6 @@ pub enum AppId {
     Setup,
     Performance,
     Programmer,
+    Daw,
     PaletteEditor,
 }
-

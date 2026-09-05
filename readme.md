@@ -22,6 +22,7 @@ Alternatively, download the `.syx` file from the [releases page](../../releases)
   - Asynchronous MIDI processing
   - Optimized flash storage read/write routines
 - [Roadrunner](https://github.com/anthonyhfm/lppmk3-roadrunner) support on the Launchpad Pro Mk3 (high-speed LED system)
+- DAW integration: Session control on all targets, model-specific page navigation and native faders
 - Multiple built-in color palettes
   - Novation palette
   - Mat1jaczyyy palette
@@ -51,7 +52,7 @@ Novation Launchpad support:
 
 ## Roadmap
 
-- Native Live Modes for all Launchpads
+- Complete native Live instrument modes
 - Note Mode
 - Chord Mode
 - Custom Modes via Novation Components on all Launchpads

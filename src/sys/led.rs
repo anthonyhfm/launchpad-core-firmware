@@ -8,7 +8,11 @@ use crate::sys::settings;
 #[cfg(feature = "rgb-color")]
 use crate::utils::palette::{PALETTE_MAT1JACZYYY, PALETTE_MXOS, PALETTE_NOVATION};
 
-const LED_COUNT: usize = 100;
+const LED_COUNT: usize = if cfg!(feature = "launchpad-pro-mk3") {
+    128
+} else {
+    100
+};
 const DEFAULT_TEMPO_BAR_TICKS: u32 = 2000;
 const MIN_TEMPO_BAR_TICKS: u32 = 8;
 const MIDI_CLOCKS_PER_BAR: u8 = 96;
@@ -196,6 +200,40 @@ pub fn novation_raw(index: u8, velocity: u8) {
     driver::set_led_raw(index, r, g, b);
 }
 
+/// Fixed DAW palette, independent of the Performance palette selection.
+pub fn novation_rgb(value: u8) -> [u8; 3] {
+    #[cfg(feature = "rgb-color")]
+    let (r, g, b) = PALETTE_NOVATION.rgb(value);
+    #[cfg(not(feature = "rgb-color"))]
+    let (r, g, b) = rg_palette_rgb(value);
+    [r, g, b]
+}
+
+/// Replace a DAW LED's complete state at its physical address.
+pub fn daw_raw(index: u8, base: [u8; 3], flash: Option<[u8; 3]>, pulse: bool) {
+    if !is_valid_index(index) {
+        return;
+    }
+    LED_STATE.with(|state| {
+        let i = index as usize;
+        let base = LedColor::raw6(base[0], base[1], base[2]);
+        state.base[i] = base;
+        state.pulse[i] = if pulse { base } else { LedColor::NONE };
+        state.flash[i] = flash
+            .map(|c| LedColor::raw6(c[0], c[1], c[2]))
+            .unwrap_or(LedColor::NONE);
+        let bar = state.tempo_bar();
+        let colour = if flash.is_some() && state.tempo_counter % (bar >> 2) < (bar >> 3) {
+            state.flash[i]
+        } else if pulse {
+            base.scaled(pulse_factor(state.tempo_counter, bar))
+        } else {
+            base
+        };
+        render_color(index, colour);
+    });
+}
+
 pub fn pulse(index: u8, color: u32) {
     pulse_raw(rotation::to_raw(index), color);
 }
@@ -287,6 +325,14 @@ pub fn tick() {
 
         for index in 0..LED_COUNT {
             let pulse = state.pulse[index];
+            let flash = state.flash[index];
+            if !flash.is_none() && !pulse.is_none() {
+                render_color(
+                    index as u8,
+                    if flash_on { flash } else { pulse.scaled(pulse_factor) },
+                );
+                continue;
+            }
             if !pulse.is_none() {
                 render_color(index as u8, pulse.scaled(pulse_factor));
                 continue;

@@ -152,7 +152,7 @@ impl App for PerformanceApp {
     fn on_tick(&mut self) {}
 }
 
-fn apply_velocity_curve(curve: u8, value: u8) -> u8 {
+pub(crate) fn apply_velocity_curve(curve: u8, value: u8) -> u8 {
     match curve {
         0 => velocity_curve_low(value),
         2 => velocity_curve_high(value),
