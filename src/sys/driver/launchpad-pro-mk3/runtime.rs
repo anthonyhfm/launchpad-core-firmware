@@ -256,17 +256,25 @@ impl Driver for RuntimeDriver {
     fn send_midi(&mut self, port: crate::sys::midi::MidiPort, data: &[u8]) {
         let _ = super::usb::enqueue_tx_message(port.as_cable(), data);
     }
+
     fn flash_size(&mut self) -> u32 {
         self.flash.capacity() as u32
     }
+
     fn read_flash(&mut self, offset: u32, data: &mut [u8]) {
         if self.flash.read(offset, data).is_err() {
             data.fill(0xff);
         }
     }
+
     fn write_flash(&mut self, offset: u32, data: &[u8]) {
         let _ = self.flash.write(offset, data);
     }
+
+    fn prepare_settings_storage(&mut self, wire_size: usize, validate: fn(&[u8]) -> bool) {
+        let _ = self.flash.migrate_legacy_settings(wire_size, validate);
+    }
+
     fn device_id(&self) -> u8 {
         35
     }

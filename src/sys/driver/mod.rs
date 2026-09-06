@@ -118,6 +118,7 @@ pub trait Driver {
     fn flash_size(&mut self) -> u32;
     fn read_flash(&mut self, offset: u32, data: &mut [u8]);
     fn write_flash(&mut self, offset: u32, data: &[u8]);
+    fn prepare_settings_storage(&mut self, _wire_size: usize, _validate: fn(&[u8]) -> bool) {}
     fn device_id(&self) -> u8;
     fn highspeed_leds_enabled(&self) -> bool {
         false
@@ -225,6 +226,10 @@ pub fn read_flash(offset: u32, data: &mut [u8]) {
 
 pub fn write_flash(offset: u32, data: &[u8]) {
     let _ = with(|driver| driver.write_flash(offset, data));
+}
+
+pub fn prepare_settings_storage(wire_size: usize, validate: fn(&[u8]) -> bool) {
+    let _ = with(|driver| driver.prepare_settings_storage(wire_size, validate));
 }
 
 pub fn device_id() -> u8 {

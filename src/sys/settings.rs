@@ -16,6 +16,12 @@ const PALETTE_OFFSET: usize = SETTINGS_DATA_OFFSET + BASIC_SETTINGS_SIZE;
 const CUSTOM_PALETTE_BYTES: usize = 3 * 3 * 128;
 const SETTINGS_WIRE_SIZE: usize = PALETTE_OFFSET + CUSTOM_PALETTE_BYTES;
 
+#[cfg(feature = "launchpad-pro-mk3")]
+const _: () = assert!(
+    SETTINGS_WIRE_SIZE
+        <= crate::sys::driver::common::storage::external::SETTINGS_SIZE as usize
+);
+
 #[derive(Copy, Clone)]
 pub struct Settings {
     pub brightness: u8,
@@ -183,6 +189,10 @@ pub fn update(f: impl FnOnce(&mut Settings)) {
 }
 
 pub fn load() {
+    // Device drivers may need to move settings away from storage owned by the
+    // stock firmware before the normal logical settings mapping is accessed.
+    driver::prepare_settings_storage(SETTINGS_WIRE_SIZE, validate_wire_image);
+
     let flash_size = driver::flash_size() as usize;
     let read_len = min_usize(
         min_usize(flash_size, SETTINGS_FLASH_SIZE),
@@ -238,7 +248,11 @@ const fn min_usize(a: usize, b: usize) -> usize {
     if a < b { a } else { b }
 }
 
-fn validate_wire_image(input: &[u8; SETTINGS_WIRE_SIZE]) -> bool {
+fn validate_wire_image(input: &[u8]) -> bool {
+    if input.len() < SETTINGS_WIRE_SIZE {
+        return false;
+    }
+
     if input[..SETTINGS_MAGIC.len()] != SETTINGS_MAGIC {
         return false;
     }

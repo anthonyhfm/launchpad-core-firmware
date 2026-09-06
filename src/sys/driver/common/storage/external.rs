@@ -9,13 +9,13 @@ use core::convert::Infallible;
 #[cfg(feature = "launchpad-pro-mk3")]
 use embedded_hal::digital::v2::OutputPin;
 
+use embassy_stm32::Peri;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::mode::Blocking;
 use embassy_stm32::peripherals;
 use embassy_stm32::spi::mode::Master;
 use embassy_stm32::spi::{Config as SpiConfig, Spi};
 use embassy_stm32::time::Hertz;
-use embassy_stm32::Peri;
 
 use embedded_storage::nor_flash::{
     check_erase, check_read, check_write, ErrorType, NorFlash, NorFlashErrorKind, ReadNorFlash,
@@ -31,8 +31,23 @@ pub const TOTAL_SIZE: u32 = 16 * 1024 * 1024;
 #[cfg(not(feature = "launchpad-pro-mk3"))]
 pub const TOTAL_SIZE: u32 = 1024 * 1024;
 
+#[cfg(feature = "launchpad-pro-mk3")]
+pub const SETTINGS_SIZE: u32 = (SECTOR_SIZE - PAGE_SIZE) as u32;
+#[cfg(not(feature = "launchpad-pro-mk3"))]
 pub const SETTINGS_SIZE: u32 = 8 * 1024;
+
+#[cfg(feature = "launchpad-pro-mk3")]
+pub const SETTINGS_OFFSET: u32 = TOTAL_SIZE - 2 * SECTOR_SIZE as u32 + PAGE_SIZE as u32;
+#[cfg(not(feature = "launchpad-pro-mk3"))]
 pub const SETTINGS_OFFSET: u32 = TOTAL_SIZE - SETTINGS_SIZE;
+
+#[cfg(feature = "launchpad-pro-mk3")]
+const LEGACY_SETTINGS_OFFSET: u32 = TOTAL_SIZE - 2 * SECTOR_SIZE as u32;
+
+#[cfg(feature = "launchpad-pro-mk3")]
+const _: () = assert!(LEGACY_SETTINGS_OFFSET == 0x00ff_e000);
+#[cfg(feature = "launchpad-pro-mk3")]
+const _: () = assert!(SETTINGS_OFFSET == 0x00ff_e100);
 
 #[cfg(feature = "launchpad-pro-mk3")]
 const EXPECTED_JEDEC_MANUFACTURER: u8 = 0xc2;
@@ -169,6 +184,62 @@ impl<'d> ExtFlash<'d> {
 
     pub fn write_settings(&mut self, offset: u32, data: &[u8]) {
         let _ = self.write(offset, data);
+    }
+
+    #[cfg(feature = "launchpad-pro-mk3")]
+    pub fn migrate_legacy_settings(
+        &mut self,
+        wire_size: usize,
+        validate: fn(&[u8]) -> bool,
+    ) -> Result<bool, NorFlashErrorKind> {
+        if wire_size == 0 || wire_size > SECTOR_SIZE - PAGE_SIZE {
+            return Err(NorFlashErrorKind::OutOfBounds);
+        }
+
+        let (flash, sector_buf) = (&mut self.flash, &mut self.sector_buf);
+        let flash = flash.as_mut().ok_or(NorFlashErrorKind::Other)?;
+
+        sector_buf.fill(0xff);
+        flash
+            .read(LEGACY_SETTINGS_OFFSET, sector_buf)
+            .map_err(|_| NorFlashErrorKind::Other)?;
+
+        if !validate(&sector_buf[..wire_size]) {
+            return Ok(false);
+        }
+
+        sector_buf.copy_within(0..wire_size, PAGE_SIZE);
+        sector_buf[..PAGE_SIZE].fill(0xff);
+
+        flash
+            .erase_sectors(LEGACY_SETTINGS_OFFSET, 1)
+            .map_err(|_| NorFlashErrorKind::Other)?;
+
+        for page_off in (0..SECTOR_SIZE).step_by(PAGE_SIZE) {
+            if !sector_buf[page_off..page_off + PAGE_SIZE]
+                .iter()
+                .all(|byte| *byte == 0xff)
+            {
+                flash
+                    .write_bytes(
+                        LEGACY_SETTINGS_OFFSET + page_off as u32,
+                        &mut sector_buf[page_off..page_off + PAGE_SIZE],
+                    )
+                    .map_err(|_| NorFlashErrorKind::Other)?;
+            }
+        }
+
+        let mut verify = [0xff; PAGE_SIZE];
+        for page_off in (0..SECTOR_SIZE).step_by(PAGE_SIZE) {
+            flash
+                .read(LEGACY_SETTINGS_OFFSET + page_off as u32, &mut verify)
+                .map_err(|_| NorFlashErrorKind::Other)?;
+            if verify != sector_buf[page_off..page_off + PAGE_SIZE] {
+                return Err(NorFlashErrorKind::Other);
+            }
+        }
+
+        Ok(true)
     }
 
     pub fn info(&mut self) -> ExtFlashInfo {
