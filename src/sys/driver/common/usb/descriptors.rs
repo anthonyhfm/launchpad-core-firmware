@@ -40,7 +40,7 @@ pub const MS_HEADER_TOTAL_LEN: u16 = 93;
 
 pub fn build_config_descriptor(cfg: &UsbDeviceConfig, out: &mut [u8; CONFIG_DESCRIPTOR_LEN]) {
     let ep_out_addr = if cfg.use_ep2_for_out { 0x02 } else { 0x01 };
-    let ep_attr = if cfg.use_ep2_for_out { 0x03 } else { 0x02 }; // 0x02 = Bulk, 0x03 = Interrupt
+    let ep_attr = 0x02; // 0x02 = Bulk
 
     let max_power = (cfg.max_power_ma / 2).min(255) as u8;
 

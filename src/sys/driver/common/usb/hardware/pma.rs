@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2025-2026 Anthony Hofmeister
 
+use super::super::UsbDeviceConfig;
+use super::super::control::{SetupAction, control, handle_setup_request, next_ep0_chunk};
+use super::super::midi::{SysexReceiver, parse_usb_midi_packet};
+use super::super::queues::queues;
 use core::cell::UnsafeCell;
 use core::ptr;
-use super::super::UsbDeviceConfig;
-use super::super::control::{control, handle_setup_request, next_ep0_chunk, SetupAction};
-use super::super::midi::{parse_usb_midi_packet, SysexReceiver};
-use super::super::queues::queues;
 use stm32_metapac as pac;
 
 const USB_BASE: usize = 0x4000_5c00;
@@ -40,6 +40,7 @@ const EP_TYPE: u16 = 0b11 << 9;
 const EP_KIND: u16 = 1 << 8;
 const EP_TYPE_CONTROL: u16 = 0b01 << 9;
 const EP_TYPE_BULK: u16 = 0b00 << 9;
+#[allow(dead_code)] // Added cuz compiler generates warning that interrupt is unused.
 const EP_TYPE_INTERRUPT: u16 = 0b11 << 9;
 const EP_CTR_TX: u16 = 1 << 7;
 const EP_DTOG_TX: u16 = 1 << 6;
@@ -204,8 +205,8 @@ unsafe fn reset_bus() {
             set_btable(EP2, 0, 0, ep2_rx_addr, rx_count(EP_MAX_PACKET));
 
             set_ep_reg(EP0, EP_TYPE_CONTROL | 0, EP_STAT_NAK, EP_STAT_VALID);
-            set_ep_reg(EP1, EP_TYPE_INTERRUPT | 1, EP_STAT_NAK, EP_STAT_DISABLED);
-            set_ep_reg(EP2, EP_TYPE_INTERRUPT | 2, EP_STAT_DISABLED, EP_STAT_VALID);
+            set_ep_reg(EP1, EP_TYPE_BULK | 1, EP_STAT_NAK, EP_STAT_DISABLED);
+            set_ep_reg(EP2, EP_TYPE_BULK | 2, EP_STAT_DISABLED, EP_STAT_VALID);
         } else {
             set_btable(EP1, ep1_tx_addr, 0, ep1_rx_addr, rx_count(EP_MAX_PACKET));
 
@@ -318,12 +319,10 @@ fn process_setup(setup: [u8; 8]) {
                 set_rx_stat(EP0, EP_STAT_VALID);
             }
         }
-        SetupAction::Stall => {
-            unsafe {
-                set_tx_stat(EP0, EP_STAT_STALL);
-                set_rx_stat(EP0, EP_STAT_STALL);
-            }
-        }
+        SetupAction::Stall => unsafe {
+            set_tx_stat(EP0, EP_STAT_STALL);
+            set_rx_stat(EP0, EP_STAT_STALL);
+        },
         SetupAction::ConfigurationChanged(cfg_val) => {
             if cfg_val != 0 {
                 unsafe {
