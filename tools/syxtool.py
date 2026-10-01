@@ -29,6 +29,8 @@ LPX_PRODUCT_ID = 0x0C
 LPMINIMK3_PRODUCT_ID = 0x0D
 LPPROMK3_PRODUCT_ID = 0x0E
 LPSLOTH_PRODUCT_ID = 0x0F
+FLPAD_PRODUCT_ID = 0x20
+FLPADMINI_PRODUCT_ID = 0x21
 LPMK2_PRODUCT_ID = 0x69
 LPPRO_PRODUCT_ID = 0x51
 LPS_PRODUCT_ID = 0x20
@@ -55,6 +57,8 @@ class Product:
 	product_id: Optional[int] = None
 	legacy_product_id: Optional[int] = None
 	block_size_bytes: int = BLOCK_SIZE_BYTES
+	# FLPad 437 uses six raw MIDI bytes instead of the older version nibbles.
+	version_format: str = "nibbles"
 
 PRODUCTS = [
 	Product("/x", "Launchpad X", "lpx", family_id=LPX_FAMILY_ID, product_id=LPX_PRODUCT_ID),
@@ -65,6 +69,8 @@ PRODUCTS = [
 	Product("/lps", "Launchpad S", "legacy", legacy_product_id=LPS_PRODUCT_ID),
 	Product("/minimk1", "Launchpad Mini MK1", "legacy", legacy_product_id=LPMINIMK1_PRODUCT_ID),
 	Product("/sloth", "Sloth Coprocessor", "lpx", family_id=LPX_FAMILY_ID, product_id=LPSLOTH_PRODUCT_ID),
+	Product("/flpad", "FLPad", "lpx", family_id=LPX_FAMILY_ID, product_id=FLPAD_PRODUCT_ID, version_format="bytes"),
+	Product("/flpadmini", "FLPad Mini", "lpx", family_id=LPX_FAMILY_ID, product_id=FLPADMINI_PRODUCT_ID, version_format="bytes"),
 ]
 
 class BinToSyx:
@@ -77,6 +83,18 @@ class BinToSyx:
 		self.output_data = bytearray()
 
 	def _parse_version(self, version: str) -> List[int]:
+		if self.product.version_format == "bytes":
+			# Preserve the observed INIT/HEADER bytes without guessing the meaning
+			# of each field from one firmware sample. Both 437 files use this value.
+			if len(version) != 12:
+				raise ValueError("FLPad version must be six raw MIDI bytes (12 hex characters; firmware 437: 010103350000)")
+			try:
+				parsed = list(bytes.fromhex(version))
+			except ValueError:
+				raise ValueError("FLPad version must contain hexadecimal byte pairs") from None
+			if len(parsed) != 6 or any(v > 0x7F for v in parsed):
+				raise ValueError("FLPad version must contain six 7-bit MIDI bytes (00..7F)")
+			return parsed
 		expected = {3}
 		if self.product.mode == "legacy":
 			expected.add(6)
@@ -235,21 +253,18 @@ class BinToSyx:
 			raise ValueError(f"{self.product.flag} is not a modern product")
 		blocks = max(1, math.ceil(len(self.input_data) / self._block_size_bytes()))
 		init_msg = self._create_sysex_start(UPDATE_INIT)
-		init_msg.extend([
-			self.product.family_id,
-			self.product.product_id,
-			0x00, 0x00, 0x00,
-			self.version[0] & 0xF,
-			self.version[1] & 0xF,
-			self.version[2] & 0xF
-		])
+		version_bytes = self.version if self.product.version_format == "bytes" else [0, 0, 0] + self.version
+		init_msg.extend([self.product.family_id, self.product.product_id])
+		init_msg.extend(version_bytes)
 		init_msg.append(SYSEX_END)
 		self.output_data.extend(init_msg)
 		if self.product.mode == "lpx":
 			header = self._create_sysex_start(UPDATE_HEADER)
 			header.append(1 if self.product.product_id == LPPROMK3_PRODUCT_ID else 0)
-			header.extend([0x30, 0x30, 0x30])
-			header.extend([0x30 | (v & 0xF) for v in self.version[:3]])
+			if self.product.version_format == "bytes":
+				header.extend(version_bytes)
+			else:
+				header.extend(0x30 | v for v in version_bytes)
 			header.extend(self._uint_to_nibbles(len(self.input_data)))
 			crc = self._crc32(self.input_data)
 			if self.product.product_id == LPPROMK3_PRODUCT_ID:
@@ -450,7 +465,7 @@ def syxtobin(input_path: str, output_path: Optional[str]):
 	print(f"Success! Saved to {output_path}")
 
 def main():
-	p = argparse.ArgumentParser(description="Launchpad firmware SysEx/bin tool")
+	p = argparse.ArgumentParser(description="Launchpad firmware SysEx/bin tool", epilog="FLPad / FLPad Mini: version is six raw MIDI bytes as 12 hex characters (firmware 437: 010103350000). Other modern products use three hex version digits.")
 	g = p.add_mutually_exclusive_group(required=True)
 	g.add_argument("--to-syx", action="store_true")
 	g.add_argument("--to-bin", action="store_true")
