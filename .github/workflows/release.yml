@@ -2,6 +2,12 @@ name: Release Firmware
 
 on:
   workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build and release"
+        required: true
+        default: "code"
+        type: string
 
 permissions:
   contents: write
@@ -13,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: refs/heads/${{ inputs.branch }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
