@@ -49,6 +49,29 @@ Novation Launchpad support:
 | Launchpad Mini Mk1 |   ✅    | ❌  |       ❌        |      ❌       |
 | Launchpad S        |   ✅    | ❌  |       ❌        |      ❌       |
 
+### FLPad firmware conversion
+
+`tools/syxtool.py` also supports **FLPad** (Launchpad X variant) and
+**FLPad Mini** (Launchpad Mini Mk3 variant) as firmware conversion targets.
+Their updater product IDs are `0x20` and `0x21`, respectively, in family `0x02`.
+CoreFW device builds and hardware validation for these variants are still pending.
+
+Use `/flpad` or `/flpadmini` when converting a BIN to SysEx. These targets use
+six raw MIDI version bytes, supplied as 12 hexadecimal characters. Both stock
+firmware 437 files use `010103350000`:
+
+```sh
+python3 tools/syxtool.py --to-syx /flpad 010103350000 flpad.bin flpad.syx
+python3 tools/syxtool.py --to-syx /flpadmini 010103350000 flpadmini.bin flpadmini.syx
+```
+
+SysEx-to-BIN conversion detects the target automatically:
+
+```sh
+python3 tools/syxtool.py --to-bin flpad.syx flpad.bin
+python3 tools/syxtool.py --to-bin flpadmini.syx flpadmini.bin
+```
+
 ## Roadmap
 
 - Native Live Modes for all Launchpads
