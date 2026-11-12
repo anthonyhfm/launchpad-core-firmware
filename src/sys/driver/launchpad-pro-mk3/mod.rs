@@ -10,31 +10,6 @@ pub mod led;
 mod map;
 mod runtime;
 pub mod usb;
-pub fn init_usb_board() {
-    let otg = stm32_metapac::USB_OTG_FS;
-    unsafe {
-        let gccfg_ptr = otg.gccfg_v1().as_ptr() as *mut u32;
-        let gotgctl_ptr = otg.gotgctl().as_ptr() as *mut u32;
-
-        const USB_OTG_GCCFG_PWRDWN: u32 = 1 << 16;
-        const USB_OTG_GCCFG_VBDEN: u32 = 1 << 21;
-        const USB_OTG_GOTGCTL_VBVALOEN: u32 = 1 << 2;
-        const USB_OTG_GOTGCTL_VBVALOVAL: u32 = 1 << 3;
-        const USB_OTG_GOTGCTL_BVALOEN: u32 = 1 << 6;
-        const USB_OTG_GOTGCTL_BVALOVAL: u32 = 1 << 7;
-
-        let mut gccfg = core::ptr::read_volatile(gccfg_ptr);
-        gccfg |= USB_OTG_GCCFG_PWRDWN;
-        gccfg &= !USB_OTG_GCCFG_VBDEN;
-        core::ptr::write_volatile(gccfg_ptr, gccfg);
-
-        let mut gotgctl = core::ptr::read_volatile(gotgctl_ptr);
-        gotgctl &= !(USB_OTG_GOTGCTL_VBVALOEN | USB_OTG_GOTGCTL_VBVALOVAL);
-        gotgctl |= USB_OTG_GOTGCTL_BVALOEN | USB_OTG_GOTGCTL_BVALOVAL;
-        core::ptr::write_volatile(gotgctl_ptr, gotgctl);
-    }
-}
-
 use embassy_executor::Spawner;
 use embassy_stm32::Config;
 use embassy_stm32::rcc::{

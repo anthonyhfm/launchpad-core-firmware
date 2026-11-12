@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2025-2026 Anthony Hofmeister
 
-use core::cell::UnsafeCell;
 use super::UsbDeviceConfig;
 use super::descriptors::{
-    build_config_descriptor, build_device_descriptor, encode_string_descriptor,
     CONFIG_DESCRIPTOR_LEN, DESC_CONFIGURATION, DESC_DEVICE, DESC_STRING, STRING_LANG_ID,
+    build_config_descriptor, build_device_descriptor, encode_string_descriptor,
 };
+use core::cell::UnsafeCell;
 
 pub const REQ_GET_STATUS: u8 = 0x00;
 pub const REQ_CLEAR_FEATURE: u8 = 0x01;
@@ -20,7 +20,7 @@ pub const REQ_SET_INTERFACE: u8 = 0x0b;
 pub struct ControlState {
     pub cfg: Option<&'static UsbDeviceConfig>,
     pub configuration: u8,
-    pub pending_address: u8,
+    pub pending_address: Option<u8>,
     pub tx_data: *const u8,
     pub tx_len: usize,
     pub tx_pos: usize,
@@ -36,7 +36,7 @@ impl ControlState {
         Self {
             cfg: None,
             configuration: 0,
-            pending_address: 0,
+            pending_address: None,
             tx_data: core::ptr::null(),
             tx_len: 0,
             tx_pos: 0,
@@ -48,17 +48,21 @@ impl ControlState {
         }
     }
 
+    pub fn abort_transfer(&mut self) {
+        self.pending_address = None;
+        self.tx_data = core::ptr::null();
+        self.tx_len = 0;
+        self.tx_pos = 0;
+        self.tx_zlp = false;
+    }
+
     pub fn init(&mut self, cfg: &'static UsbDeviceConfig) {
         self.cfg = Some(cfg);
         build_device_descriptor(cfg, &mut self.device_desc);
         build_config_descriptor(cfg, &mut self.config_desc);
         self.inited = true;
         self.configuration = 0;
-        self.pending_address = 0;
-        self.tx_data = core::ptr::null();
-        self.tx_len = 0;
-        self.tx_pos = 0;
-        self.tx_zlp = false;
+        self.abort_transfer();
     }
 }
 
@@ -80,7 +84,12 @@ pub enum SetupAction {
 }
 
 pub fn handle_setup_request(setup: [u8; 8]) -> SetupAction {
-    let state = control();
+    handle_setup(control(), setup)
+}
+
+pub fn handle_setup(state: &mut ControlState, setup: [u8; 8]) -> SetupAction {
+    state.abort_transfer();
+
     let Some(cfg) = state.cfg else {
         return SetupAction::Stall;
     };
@@ -103,7 +112,9 @@ pub fn handle_setup_request(setup: [u8; 8]) -> SetupAction {
             let desc_index = (value & 0xff) as u8;
 
             let (ptr, full_len) = match desc_type {
-                DESC_DEVICE if desc_index == 0 => (state.device_desc.as_ptr(), state.device_desc.len()),
+                DESC_DEVICE if desc_index == 0 => {
+                    (state.device_desc.as_ptr(), state.device_desc.len())
+                }
                 DESC_CONFIGURATION if desc_index == 0 => {
                     (state.config_desc.as_ptr(), state.config_desc.len())
                 }
@@ -127,8 +138,14 @@ pub fn handle_setup_request(setup: [u8; 8]) -> SetupAction {
 
             start_control_read(state, ptr, full_len, length)
         }
-        (false, REQ_SET_ADDRESS) => {
-            state.pending_address = (value & 0x7f) as u8;
+        (false, REQ_SET_ADDRESS)
+            if bm_request_type == 0
+                && value <= 127
+                && index == 0
+                && length == 0
+                && state.configuration == 0 =>
+        {
+            state.pending_address = Some(value as u8);
             SetupAction::StatusIn
         }
         (false, REQ_SET_CONFIGURATION) if value <= 1 => {
@@ -160,7 +177,10 @@ pub fn start_control_read(
     data_len: usize,
     requested_len: usize,
 ) -> SetupAction {
-    let ep0_max = state.cfg.map(|c| c.ep0_max_packet_size as usize).unwrap_or(64);
+    let ep0_max = state
+        .cfg
+        .map(|c| c.ep0_max_packet_size as usize)
+        .unwrap_or(64);
     state.tx_data = data;
     state.tx_len = data_len.min(requested_len);
     state.tx_pos = 0;
@@ -174,8 +194,31 @@ pub fn start_control_read(
     }
 }
 
+pub enum Ep0InCompletion {
+    Ignore,
+    SetAddress(u8),
+    SendPacket { data: *const u8, len: usize },
+    ArmOut,
+}
+
+pub fn complete_ep0_in(state: &mut ControlState, setup_pending: bool) -> Ep0InCompletion {
+    if setup_pending {
+        return Ep0InCompletion::Ignore;
+    }
+    if let Some(address) = state.pending_address.take() {
+        Ep0InCompletion::SetAddress(address)
+    } else if let Some((data, len)) = next_ep0_chunk(state) {
+        Ep0InCompletion::SendPacket { data, len }
+    } else {
+        Ep0InCompletion::ArmOut
+    }
+}
+
 pub fn next_ep0_chunk(state: &mut ControlState) -> Option<(*const u8, usize)> {
-    let ep0_max = state.cfg.map(|c| c.ep0_max_packet_size as usize).unwrap_or(64);
+    let ep0_max = state
+        .cfg
+        .map(|c| c.ep0_max_packet_size as usize)
+        .unwrap_or(64);
     let remain = state.tx_len.saturating_sub(state.tx_pos);
     if remain > 0 {
         let len = remain.min(ep0_max);

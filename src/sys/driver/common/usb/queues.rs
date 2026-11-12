@@ -58,6 +58,11 @@ impl<T: Copy, const N: usize> Ring<T, N> {
         self.head == self.tail
     }
 
+    pub fn clear(&mut self) {
+        self.head = 0;
+        self.tail = 0;
+    }
+
     pub fn len(&self) -> usize {
         if self.head >= self.tail {
             self.head - self.tail
@@ -78,6 +83,12 @@ pub struct UsbQueues {
 }
 
 impl UsbQueues {
+    pub fn clear(&mut self) {
+        self.midi_rx.clear();
+        self.sysex_rx.clear();
+        self.midi_tx.clear();
+    }
+
     pub const fn new() -> Self {
         Self {
             midi_rx: Ring::new(MidiEvent {

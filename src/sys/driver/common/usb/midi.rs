@@ -50,6 +50,11 @@ impl SysexReceiver {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.len = [0; 3];
+        self.active = [false; 3];
+    }
+
     fn receive(&mut self, port: MidiPort, bytes: &[u8]) -> Option<SysexMessage> {
         let cable = port as usize;
         for &byte in bytes {
