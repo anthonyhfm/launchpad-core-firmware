@@ -51,10 +51,18 @@ impl SysexReceiver {
     }
 
     pub fn append(&mut self, bytes: &[u8]) {
+        if self.len == 0 && bytes.first() != Some(&0xf0) {
+            return;
+        }
         let space = SYSEX_MAX_LEN.saturating_sub(self.len);
         let to_copy = bytes.len().min(space);
         self.buf[self.len..self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
         self.len += to_copy;
+    }
+
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.port = MidiPort::Daw;
     }
 
     pub fn take(&mut self) -> Option<SysexMessage> {

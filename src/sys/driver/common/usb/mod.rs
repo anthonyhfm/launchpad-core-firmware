@@ -39,11 +39,11 @@ pub fn poll() {
 }
 
 pub fn dequeue_midi_event() -> Option<MidiEvent> {
-    queues().midi_rx.pop()
+    cortex_m::interrupt::free(|_| queues().midi_rx.pop())
 }
 
 pub fn dequeue_sysex_message() -> Option<SysexMessage> {
-    queues().sysex_rx.pop()
+    cortex_m::interrupt::free(|_| queues().sysex_rx.pop())
 }
 
 pub fn enqueue_tx_message(port: u8, data: &[u8]) -> Result<(), ()> {
@@ -51,14 +51,16 @@ pub fn enqueue_tx_message(port: u8, data: &[u8]) -> Result<(), ()> {
     let count = midi::encode_usb_midi_packets(port, data, &mut temp)?;
 
     cortex_m::interrupt::free(|_| {
-        let q = queues();
-        if q.midi_tx.free_space() < count {
-            return Err(());
-        }
-
-        for packet in temp.iter().take(count) {
-            if !q.midi_tx.push(*packet) {
+        {
+            let q = queues();
+            if q.midi_tx.free_space() < count {
                 return Err(());
+            }
+
+            for packet in temp.iter().take(count) {
+                if !q.midi_tx.push(*packet) {
+                    return Err(());
+                }
             }
         }
 

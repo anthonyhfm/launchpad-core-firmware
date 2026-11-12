@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2025-2026 Anthony Hofmeister
 
+use super::super::UsbDeviceConfig;
+use super::super::control::{SetupAction, control, handle_setup_request, next_ep0_chunk};
+use super::super::midi::{SysexReceiver, parse_usb_midi_packet};
+use super::super::queues::queues;
 use core::cell::UnsafeCell;
 use core::ptr;
-use super::super::UsbDeviceConfig;
-use super::super::control::{control, handle_setup_request, next_ep0_chunk, SetupAction};
-use super::super::midi::{parse_usb_midi_packet, SysexReceiver};
-use super::super::queues::queues;
 use stm32_metapac as pac;
 
 const USB_BASE: usize = 0x4000_5c00;
@@ -190,6 +190,8 @@ unsafe fn reset_bus() {
     };
     ctrl.init(cfg);
 
+    reset_transport_session();
+
     let (ep0_rx_addr, ep0_tx_addr, ep1_tx_addr, ep1_rx_addr, ep2_rx_addr) = pma_layout(cfg);
 
     unsafe {
@@ -204,19 +206,49 @@ unsafe fn reset_bus() {
             set_btable(EP2, 0, 0, ep2_rx_addr, rx_count(EP_MAX_PACKET));
 
             set_ep_reg(EP0, EP_TYPE_CONTROL | 0, EP_STAT_NAK, EP_STAT_VALID);
-            set_ep_reg(EP1, EP_TYPE_INTERRUPT | 1, EP_STAT_NAK, EP_STAT_DISABLED);
-            set_ep_reg(EP2, EP_TYPE_INTERRUPT | 2, EP_STAT_DISABLED, EP_STAT_VALID);
+            set_ep_reg(
+                EP1,
+                EP_TYPE_INTERRUPT | 1,
+                EP_STAT_DISABLED,
+                EP_STAT_DISABLED,
+            );
+            set_ep_reg(
+                EP2,
+                EP_TYPE_INTERRUPT | 2,
+                EP_STAT_DISABLED,
+                EP_STAT_DISABLED,
+            );
         } else {
             set_btable(EP1, ep1_tx_addr, 0, ep1_rx_addr, rx_count(EP_MAX_PACKET));
 
             set_ep_reg(EP0, EP_TYPE_CONTROL | 0, EP_STAT_NAK, EP_STAT_VALID);
-            set_ep_reg(EP1, EP_TYPE_BULK | 1, EP_STAT_NAK, EP_STAT_NAK);
+            set_ep_reg(EP1, EP_TYPE_BULK | 1, EP_STAT_DISABLED, EP_STAT_DISABLED);
         }
     }
 }
 
+fn reset_transport_session() {
+    queues().clear();
+    unsafe {
+        (*PMA_STATE.0.get()).sysex_rx.reset();
+    }
+}
+
+unsafe fn reset_data_endpoint(ep: usize) {
+    unsafe {
+        set_tx_stat(ep, EP_STAT_DISABLED);
+        set_rx_stat(ep, EP_STAT_DISABLED);
+        let register = ep_reg(ep);
+        write16(
+            (USB_BASE + ep * 4) as *mut u32,
+            (register & (EP_TYPE | EP_KIND | EP_ADDR)) | (register & (EP_DTOG_RX | EP_DTOG_TX)),
+        );
+        write_pma_u16((ep * 8 + 2) as u16, 0);
+    }
+}
+
 fn service_ep(ep: usize) {
-    let reg = ep_reg(ep);
+    let mut reg = ep_reg(ep);
     let ctrl = control();
     let Some(cfg) = ctrl.cfg else {
         return;
@@ -229,8 +261,9 @@ fn service_ep(ep: usize) {
                 let mut setup = [0u8; 8];
                 pma_read(ep0_rx_addr, &mut setup);
                 unsafe {
-                    clear_ctr(EP0, true, false);
+                    clear_ctr(EP0, true, true);
                 }
+                reg &= !EP_CTR_TX;
                 process_setup(setup);
             } else {
                 unsafe {
@@ -239,6 +272,13 @@ fn service_ep(ep: usize) {
                 }
             }
         } else if (ep == EP1 && !cfg.use_ep2_for_out) || (ep == EP2 && cfg.use_ep2_for_out) {
+            if ctrl.configuration == 0 {
+                unsafe {
+                    clear_ctr(ep, true, true);
+                    set_rx_stat(ep, EP_STAT_DISABLED);
+                }
+                return;
+            }
             let rx_count_offset = (ep * 8 + 6) as u16;
             let rx_bytes = (unsafe { read_pma_u16(rx_count_offset) } & 0x03ff) as usize;
             let mut buf = [0u8; EP_MAX_PACKET];
@@ -263,11 +303,10 @@ fn service_ep(ep: usize) {
 
         if ep == EP0 {
             let ctrl = control();
-            if ctrl.pending_address != 0 {
+            if let Some(address) = ctrl.pending_address.take() {
                 unsafe {
-                    write16(USB_DADDR, DADDR_EF | (ctrl.pending_address as u16));
+                    write16(USB_DADDR, DADDR_EF | (address as u16));
                 }
-                ctrl.pending_address = 0;
             } else if let Some((ptr, len)) = next_ep0_chunk(ctrl) {
                 let slice = if len == 0 || ptr.is_null() {
                     &[]
@@ -318,13 +357,19 @@ fn process_setup(setup: [u8; 8]) {
                 set_rx_stat(EP0, EP_STAT_VALID);
             }
         }
-        SetupAction::Stall => {
-            unsafe {
-                set_tx_stat(EP0, EP_STAT_STALL);
-                set_rx_stat(EP0, EP_STAT_STALL);
-            }
-        }
+        SetupAction::Stall => unsafe {
+            set_tx_stat(EP0, EP_STAT_STALL);
+            set_rx_stat(EP0, EP_STAT_STALL);
+        },
         SetupAction::ConfigurationChanged(cfg_val) => {
+            unsafe {
+                reset_data_endpoint(EP1);
+                if cfg.use_ep2_for_out {
+                    reset_data_endpoint(EP2);
+                }
+                let out_ep = if cfg.use_ep2_for_out { EP2 } else { EP1 };
+                write_pma_u16((out_ep * 8 + 6) as u16, rx_count(EP_MAX_PACKET));
+            }
             if cfg_val != 0 {
                 unsafe {
                     if cfg.use_ep2_for_out {
@@ -336,6 +381,8 @@ fn process_setup(setup: [u8; 8]) {
                     }
                 }
                 pump_tx();
+            } else {
+                reset_transport_session();
             }
             write_ep0_tx(EP0, ep0_tx_addr, &[]);
             unsafe {

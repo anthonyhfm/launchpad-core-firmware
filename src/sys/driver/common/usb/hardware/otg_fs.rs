@@ -1,23 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2025-2026 Anthony Hofmeister
 
-use core::cell::UnsafeCell;
 use super::super::UsbDeviceConfig;
-use super::super::control::{control, handle_setup_request, next_ep0_chunk, SetupAction};
-use super::super::midi::{parse_usb_midi_packet, SysexReceiver};
+use super::super::control::{
+    Ep0InCompletion, SetupAction, complete_ep0_in, control, handle_setup_request,
+};
+use super::super::midi::{SysexReceiver, parse_usb_midi_packet};
 use super::super::queues::queues;
+use core::cell::UnsafeCell;
 use stm32_metapac as pac;
 
 const EP_MAX_PACKET: usize = 64;
+#[cfg(feature = "launchpad-pro-mk3")]
+const CORE_HZ: u32 = 216_000_000;
+#[cfg(not(feature = "launchpad-pro-mk3"))]
+const CORE_HZ: u32 = 84_000_000;
+const DISCONNECT_DELAY_MS: u32 = 10;
+const MODE_SWITCH_DELAY_MS: u32 = 25;
+const CORE_RESET_DELAY_US: u32 = 3;
 
 struct OtgFsState {
     sysex_rx: SysexReceiver,
+    pending_setup: Option<[u8; 8]>,
 }
 
 impl OtgFsState {
     const fn new() -> Self {
         Self {
             sysex_rx: SysexReceiver::new(),
+            pending_setup: None,
         }
     }
 }
@@ -28,32 +39,42 @@ unsafe impl Sync for OtgFsStateCell {}
 static OTG_STATE: OtgFsStateCell = OtgFsStateCell(UnsafeCell::new(OtgFsState::new()));
 
 pub fn init(cfg: &'static UsbDeviceConfig) {
+    cortex_m::peripheral::NVIC::mask(pac::Interrupt::OTG_FS);
     control().init(cfg);
 
     init_clocks_and_pins();
 
     let otg = pac::USB_OTG_FS;
 
-    // Soft disconnect during setup
-    otg.dctl().write(|w| w.set_sdis(true));
+    otg.pcgcctl().write(|w| w.0 = 0);
+    otg.gahbcfg().write(|w| w.0 = 0);
+    otg.dctl().modify(|w| w.set_sdis(true));
+    cortex_m::asm::delay(CORE_HZ / 1_000 * DISCONNECT_DELAY_MS);
 
-    // Wait for AHB master IDLE
+    pac::RCC.ahb2rstr().modify(|w| w.set_usb_otg_fsrst(true));
+    let _ = pac::RCC.ahb2rstr().read();
+    pac::RCC.ahb2rstr().modify(|w| w.set_usb_otg_fsrst(false));
+    otg.pcgcctl().write(|w| w.0 = 0);
+
+    otg.gusbcfg().write(|w| w.set_physel(true));
+
     while !otg.grstctl().read().ahbidl() {}
 
-    // Core soft reset
     otg.grstctl().write(|w| w.set_csrst(true));
     while otg.grstctl().read().csrst() {}
+    cortex_m::asm::delay(CORE_HZ / 1_000_000 * CORE_RESET_DELAY_US);
 
-    // Force Device Mode, Embedded FS PHY, and turnaround time
     otg.gusbcfg().write(|w| {
         w.set_fdmod(true);
         w.set_physel(true);
         w.set_trdt(6);
     });
+    cortex_m::asm::delay(CORE_HZ / 1_000 * MODE_SWITCH_DELAY_MS);
     while otg.gintsts().read().cmod() {}
+    otg.dctl().write(|w| w.set_sdis(true));
 
-    // Power on transceiver, disable VBUS sensing (NOVBUSSENS = 1)
-    otg.gccfg_v1().modify(|w| {
+    #[cfg(not(feature = "launchpad-pro-mk3"))]
+    otg.gccfg_v1().write(|w| {
         w.set_pwrdwn(true);
         w.set_novbussens(true);
         w.set_vbusasen(false);
@@ -61,33 +82,33 @@ pub fn init(cfg: &'static UsbDeviceConfig) {
         w.set_sofouten(false);
     });
 
-    // Override B-session valid (force VBUS high in device mode)
-    otg.gotgctl().modify(|w| {
-        w.set_bvaloen(true);
-        w.set_bvaloval(true);
-    });
+    #[cfg(feature = "launchpad-pro-mk3")]
+    {
+        otg.gccfg_v2().write(|w| {
+            w.set_pwrdwn(true);
+            w.set_vbden(false);
+        });
+        otg.gotgctl().modify(|w| {
+            w.set_bvaloen(true);
+            w.set_bvaloval(true);
+        });
+    }
 
-    // Device speed: Full Speed Internal PHY
     otg.dcfg().write(|w| {
         w.set_pfivl(pac::otg::vals::Pfivl::FRAME_INTERVAL_80);
         w.set_dspd(pac::otg::vals::Dspd::FULL_SPEED_INTERNAL);
     });
 
-    // Configure FIFO sizes (total depth 320 words):
-    // RX FIFO: 128 words (512 bytes)
     otg.grxfsiz().write(|w| w.set_rxfd(128));
-    // EP0 TX FIFO: 32 words (128 bytes), start at 128
     otg.dieptxf0().write(|w| {
         w.set_sa(128);
         w.set_fd(32);
     });
-    // EP1 TX FIFO: 64 words (256 bytes), start at 160
     otg.dieptxf(0).write(|w| {
         w.set_sa(160);
         w.set_fd(64);
     });
 
-    // Flush RX and all TX FIFOs
     otg.grstctl().write(|w| {
         w.set_rxfflsh(true);
         w.set_txfflsh(true);
@@ -95,10 +116,8 @@ pub fn init(cfg: &'static UsbDeviceConfig) {
     });
     while otg.grstctl().read().rxfflsh() || otg.grstctl().read().txfflsh() {}
 
-    // Configure EP0 endpoints
     reset_core();
 
-    // Unmask endpoint transfer interrupts
     otg.diepmsk().write(|w| {
         w.set_xfrcm(true);
     });
@@ -107,16 +126,14 @@ pub fn init(cfg: &'static UsbDeviceConfig) {
         w.set_stupm(true);
     });
 
-    // Unmask device endpoint interrupts (EP0, EP1)
     otg.daintmsk().write(|w| {
         w.set_iepm(0x03);
         w.set_oepm(0x03);
     });
 
-    // Clear all pending core interrupts
-    otg.gintsts().write_value(pac::otg::regs::Gintsts(0xFFFF_FFFF));
+    otg.gintsts()
+        .write_value(pac::otg::regs::Gintsts(0xFFFF_FFFF));
 
-    // Unmask core interrupts
     otg.gintmsk().write(|w| {
         w.set_usbrst(true);
         w.set_enumdnem(true);
@@ -127,39 +144,24 @@ pub fn init(cfg: &'static UsbDeviceConfig) {
         w.set_wuim(true);
     });
 
-    // Global interrupt enable
-    otg.gahbcfg().write(|w| {
-        w.set_gint(true);
-    });
-
-    // Connect (clear soft disconnect)
-    otg.dctl().modify(|w| w.set_sdis(false));
-
     unsafe {
+        let mut nvic = cortex_m::Peripherals::steal().NVIC;
+        nvic.set_priority(pac::Interrupt::OTG_FS, 0x20);
+        cortex_m::peripheral::NVIC::unpend(pac::Interrupt::OTG_FS);
+        otg.gahbcfg().write(|w| w.set_gint(true));
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::OTG_FS);
     }
+    otg.dctl().modify(|w| w.set_sdis(false));
 }
 
 fn init_clocks_and_pins() {
-    // Enable OTG_FS clock and reset peripheral
     pac::RCC.ahb2enr().modify(|w| w.set_usb_otg_fsen(true));
-    pac::RCC.ahb2rstr().modify(|w| w.set_usb_otg_fsrst(true));
-    for _ in 0..16 {
-        cortex_m::asm::nop();
-    }
-    pac::RCC.ahb2rstr().modify(|w| w.set_usb_otg_fsrst(false));
-
-    // Enable GPIOA clock
+    let _ = pac::RCC.ahb2enr().read();
     pac::RCC.ahb1enr().modify(|w| w.set_gpioaen(true));
-
-    // Configure PA11 (DM) and PA12 (DP) as Alternate Function 10 (AF10)
-    pac::GPIOA.moder().modify(|w| {
-        w.set_moder(11, pac::gpio::vals::Moder::ALTERNATE);
-        w.set_moder(12, pac::gpio::vals::Moder::ALTERNATE);
-    });
+    let _ = pac::RCC.ahb1enr().read();
     pac::GPIOA.afr(1).modify(|w| {
-        w.set_afr(3, 10); // PA11 -> index 3 in AFRH (pins 8..15)
-        w.set_afr(4, 10); // PA12 -> index 4 in AFRH
+        w.set_afr(3, 10);
+        w.set_afr(4, 10);
     });
     pac::GPIOA.ospeedr().modify(|w| {
         w.set_ospeedr(11, pac::gpio::vals::Ospeedr::VERY_HIGH_SPEED);
@@ -169,47 +171,50 @@ fn init_clocks_and_pins() {
         w.set_pupdr(11, pac::gpio::vals::Pupdr::FLOATING);
         w.set_pupdr(12, pac::gpio::vals::Pupdr::FLOATING);
     });
+    pac::GPIOA.otyper().modify(|w| {
+        w.set_ot(11, pac::gpio::vals::Ot::PUSH_PULL);
+        w.set_ot(12, pac::gpio::vals::Ot::PUSH_PULL);
+    });
+    pac::GPIOA.moder().modify(|w| {
+        w.set_moder(11, pac::gpio::vals::Moder::ALTERNATE);
+        w.set_moder(12, pac::gpio::vals::Moder::ALTERNATE);
+    });
 }
 
 pub fn poll() {
     let otg = pac::USB_OTG_FS;
 
     loop {
-        let ints = otg.gintsts().read();
+        let ints = pac::otg::regs::Gintsts(otg.gintsts().read().0 & otg.gintmsk().read().0);
         if ints.0 == 0 {
             break;
         }
 
-        // USB Reset
         if ints.usbrst() {
             otg.gintsts().write(|w| w.set_usbrst(true));
             reset_core();
             continue;
         }
 
-        // Speed Enumeration Done
         if ints.enumdne() {
             otg.gintsts().write(|w| w.set_enumdne(true));
             otg.gusbcfg().modify(|w| w.set_trdt(6));
+            otg.dctl().modify(|w| w.set_cginak(true));
             continue;
         }
 
-        // RX FIFO Non-Empty
         if ints.rxflvl() {
             service_rx_fifo();
         }
 
-        // IN Endpoint Interrupt
         if ints.iepint() {
             service_in_endpoints();
         }
 
-        // OUT Endpoint Interrupt
         if ints.oepint() {
             service_out_endpoints();
         }
 
-        // Suspend / Wakeup
         if ints.usbsusp() {
             otg.gintsts().write(|w| w.set_usbsusp(true));
         }
@@ -217,7 +222,6 @@ pub fn poll() {
             otg.gintsts().write(|w| w.set_wkupint(true));
         }
 
-        // Break if no more core interrupts
         let after_ints = otg.gintsts().read();
         if (after_ints.0 & (1 << 4 | 1 << 12 | 1 << 18 | 1 << 19)) == 0 {
             break;
@@ -234,23 +238,41 @@ fn reset_core() {
         return;
     };
     ctrl.init(cfg);
+    queues().clear();
+    let state = unsafe { &mut *OTG_STATE.0.get() };
+    state.sysex_rx.reset();
+    state.pending_setup = None;
 
-    // Reset address
     otg.dcfg().modify(|w| w.set_dad(0));
+    otg.diepctl(1).write(|w| w.set_snak(true));
+    otg.doepctl(1).write(|w| w.set_snak(true));
+    for ep in 0..=1 {
+        otg.diepint(ep).write(|w| w.0 = 0xffff_ffff);
+        otg.doepint(ep).write(|w| w.0 = 0xffff_ffff);
+    }
+    otg.grstctl().write(|w| {
+        w.set_txfflsh(true);
+        w.set_txfnum(0x10);
+    });
+    while otg.grstctl().read().txfflsh() {}
 
-    // EP0 IN (mpsiz 0 = 64 bytes)
     otg.diepctl(0).write(|w| {
         w.set_mpsiz(0);
         w.set_snak(true);
     });
 
-    // EP0 OUT
+    otg.doepctl(0).write(|w| w.set_mpsiz(0));
+    arm_ep0_out();
+}
+
+fn arm_ep0_out() {
+    let otg = pac::USB_OTG_FS;
     otg.doeptsiz(0).write(|w| {
-        w.set_xfrsiz(64);
+        w.set_xfrsiz(EP_MAX_PACKET as u32);
+        w.set_pktcnt(1);
         w.set_rxdpid_stupcnt(3);
     });
-    otg.doepctl(0).write(|w| {
-        w.set_mpsiz(0);
+    otg.doepctl(0).modify(|w| {
         w.set_epena(true);
         w.set_cnak(true);
     });
@@ -258,8 +280,6 @@ fn reset_core() {
 
 fn service_rx_fifo() {
     let otg = pac::USB_OTG_FS;
-    let state = unsafe { &mut *OTG_STATE.0.get() };
-    let q = queues();
 
     while otg.gintsts().read().rxflvl() {
         let status = otg.grxstsp().read();
@@ -275,15 +295,8 @@ fn service_rx_fifo() {
                 setup[0..4].copy_from_slice(&w0.to_ne_bytes());
                 setup[4..8].copy_from_slice(&w1.to_le_bytes());
 
-                // Re-arm EP0 OUT for next setup
-                otg.doeptsiz(0).modify(|w| {
-                    w.set_rxdpid_stupcnt(3);
-                });
-                otg.doepctl(0).modify(|w| {
-                    w.set_cnak(true);
-                });
-
-                process_setup(setup);
+                control().abort_transfer();
+                unsafe { &mut *OTG_STATE.0.get() }.pending_setup = Some(setup);
             }
             pac::otg::vals::Pktstsd::OUT_DATA_RX => {
                 let mut buf = [0u8; EP_MAX_PACKET];
@@ -299,7 +312,9 @@ fn service_rx_fifo() {
                     rem.copy_from_slice(&data.to_ne_bytes()[..rem.len()]);
                 }
 
-                if ep_num == 1 {
+                if ep_num == 1 && control().configuration != 0 {
+                    let state = unsafe { &mut *OTG_STATE.0.get() };
+                    let q = queues();
                     for chunk in buf[..len].chunks_exact(4) {
                         parse_usb_midi_packet(
                             chunk,
@@ -312,28 +327,10 @@ fn service_rx_fifo() {
             }
             pac::otg::vals::Pktstsd::OUT_DATA_DONE => {
                 if ep_num == 1 {
-                    otg.doeptsiz(1).write(|w| {
-                        w.set_pktcnt(1);
-                        w.set_xfrsiz(64);
-                    });
-                    otg.doepctl(1).modify(|w| {
-                        w.set_cnak(true);
-                        w.set_epena(true);
-                    });
-                } else if ep_num == 0 {
-                    otg.doeptsiz(0).write(|w| {
-                        w.set_xfrsiz(64);
-                        w.set_rxdpid_stupcnt(3);
-                    });
-                    otg.doepctl(0).modify(|w| {
-                        w.set_cnak(true);
-                        w.set_epena(true);
-                    });
+                    resume_rx();
                 }
             }
-            pac::otg::vals::Pktstsd::SETUP_DATA_DONE => {
-                otg.doepint(0).write(|w| w.set_stup(true));
-            }
+            pac::otg::vals::Pktstsd::SETUP_DATA_DONE => {}
             _ => {
                 let words = (bcnt + 3) / 4;
                 for _ in 0..words {
@@ -344,35 +341,44 @@ fn service_rx_fifo() {
     }
 }
 
+fn resume_rx() {
+    let otg = pac::USB_OTG_FS;
+    if control().configuration == 0 || otg.doepctl(1).read().epena() {
+        return;
+    }
+
+    otg.doeptsiz(1).write(|w| {
+        w.set_pktcnt(1);
+        w.set_xfrsiz(EP_MAX_PACKET as u32);
+    });
+    otg.doepctl(1).modify(|w| {
+        w.set_cnak(true);
+        w.set_epena(true);
+    });
+}
+
 fn service_in_endpoints() {
     let otg = pac::USB_OTG_FS;
     let daint = otg.daint().read();
 
-    // EP0 IN
     if daint.iepint() & 1 != 0 {
         let ep_ints = otg.diepint(0).read();
         otg.diepint(0).write_value(ep_ints);
 
-        let ctrl = control();
-        if ctrl.pending_address != 0 {
-            otg.dcfg().modify(|w| w.set_dad(ctrl.pending_address));
-            ctrl.pending_address = 0;
-        } else if let Some((ptr, len)) = next_ep0_chunk(ctrl) {
-            write_ep0_in(ptr, len);
-        } else {
-            // Re-arm EP0 OUT
-            otg.doeptsiz(0).write(|w| {
-                w.set_xfrsiz(64);
-                w.set_rxdpid_stupcnt(3);
-            });
-            otg.doepctl(0).modify(|w| {
-                w.set_cnak(true);
-                w.set_epena(true);
-            });
+        if ep_ints.xfrc() {
+            let setup_pending = unsafe { &*OTG_STATE.0.get() }.pending_setup.is_some();
+            match complete_ep0_in(control(), setup_pending) {
+                Ep0InCompletion::Ignore => {}
+                Ep0InCompletion::SetAddress(address) => {
+                    otg.dcfg().modify(|w| w.set_dad(address));
+                    arm_ep0_out();
+                }
+                Ep0InCompletion::SendPacket { data, len } => write_ep0_in(data, len),
+                Ep0InCompletion::ArmOut => arm_ep0_out(),
+            }
         }
     }
 
-    // EP1 IN
     if daint.iepint() & 2 != 0 {
         let ep_ints = otg.diepint(1).read();
         otg.diepint(1).write_value(ep_ints);
@@ -387,6 +393,17 @@ fn service_out_endpoints() {
     if daint.oepint() & 1 != 0 {
         let ep_ints = otg.doepint(0).read();
         otg.doepint(0).write_value(ep_ints);
+        if ep_ints.stup() {
+            let setup = unsafe { &mut *OTG_STATE.0.get() }.pending_setup.take();
+            if let Some(setup) = setup {
+                stop_in_endpoint(0);
+                flush_tx_fifo(0);
+                otg.diepint(0).write(|w| w.0 = 0xffff_ffff);
+                process_setup(setup);
+            }
+        } else if ep_ints.xfrc() && unsafe { &*OTG_STATE.0.get() }.pending_setup.is_none() {
+            arm_ep0_out();
+        }
     }
     if daint.oepint() & 2 != 0 {
         let ep_ints = otg.doepint(1).read();
@@ -402,11 +419,6 @@ fn process_setup(setup: [u8; 8]) {
             write_ep0_in(data, len);
         }
         SetupAction::StatusIn => {
-            let ctrl = control();
-            if ctrl.pending_address != 0 {
-                otg.dcfg().modify(|w| w.set_dad(ctrl.pending_address));
-                ctrl.pending_address = 0;
-            }
             write_ep0_in(core::ptr::null(), 0);
         }
         SetupAction::Stall => {
@@ -415,7 +427,6 @@ fn process_setup(setup: [u8; 8]) {
         }
         SetupAction::ConfigurationChanged(cfg) => {
             if cfg != 0 {
-                // Configure EP1 IN (Bulk IN)
                 otg.diepctl(1).write(|w| {
                     w.set_mpsiz(64);
                     w.set_eptyp(pac::otg::vals::Eptyp::BULK);
@@ -425,7 +436,6 @@ fn process_setup(setup: [u8; 8]) {
                     w.set_usbaep(true);
                 });
 
-                // Configure EP1 OUT (Bulk OUT)
                 otg.doeptsiz(1).write(|w| {
                     w.set_pktcnt(1);
                     w.set_xfrsiz(64);
@@ -440,10 +450,60 @@ fn process_setup(setup: [u8; 8]) {
                 });
 
                 pump_tx();
+            } else {
+                deconfigure_data_endpoints();
             }
-            write_ep0_in(core::ptr::null(), 0);
+            if unsafe { &*OTG_STATE.0.get() }.pending_setup.is_none() {
+                write_ep0_in(core::ptr::null(), 0);
+            }
         }
     }
+}
+
+fn stop_in_endpoint(ep: usize) {
+    let otg = pac::USB_OTG_FS;
+    if otg.diepctl(ep).read().epena() {
+        otg.diepint(ep).write(|w| w.set_epdisd(true));
+        otg.diepctl(ep).modify(|w| w.set_snak(true));
+        otg.diepctl(ep).modify(|w| w.set_epdis(true));
+        while otg.diepctl(ep).read().epena() {}
+    }
+}
+
+fn flush_tx_fifo(ep: u8) {
+    let otg = pac::USB_OTG_FS;
+    while !otg.grstctl().read().ahbidl() {}
+    otg.grstctl().write(|w| {
+        w.set_txfnum(ep);
+        w.set_txfflsh(true);
+    });
+    while otg.grstctl().read().txfflsh() {}
+}
+
+fn deconfigure_data_endpoints() {
+    let otg = pac::USB_OTG_FS;
+    stop_in_endpoint(1);
+    if otg.doepctl(1).read().epena() {
+        otg.dctl().modify(|w| w.set_sgonak(true));
+        while !otg.gintsts().read().goutnakeff() {
+            service_rx_fifo();
+        }
+        otg.doepint(1).write(|w| w.set_epdisd(true));
+        if otg.doepctl(1).read().epena() {
+            otg.doepctl(1).modify(|w| w.set_snak(true));
+            otg.doepctl(1).modify(|w| w.set_epdis(true));
+            while otg.doepctl(1).read().epena() {}
+        }
+        otg.dctl().modify(|w| w.set_cgonak(true));
+    }
+    otg.diepctl(1).write(|w| w.set_snak(true));
+    otg.doepctl(1).write(|w| w.set_snak(true));
+    flush_tx_fifo(1);
+    service_rx_fifo();
+    otg.diepint(1).write(|w| w.0 = 0xffff_ffff);
+    otg.doepint(1).write(|w| w.0 = 0xffff_ffff);
+    queues().clear();
+    unsafe { &mut *OTG_STATE.0.get() }.sysex_rx.reset();
 }
 
 fn write_ep0_in(data: *const u8, len: usize) {
