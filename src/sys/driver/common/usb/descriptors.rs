@@ -35,8 +35,8 @@ pub fn build_device_descriptor(cfg: &UsbDeviceConfig, out: &mut [u8; 18]) {
     out[17] = 1; // bNumConfigurations
 }
 
-pub const CONFIG_DESCRIPTOR_LEN: usize = 129;
-pub const MS_HEADER_TOTAL_LEN: u16 = 93;
+pub const CONFIG_DESCRIPTOR_LEN: usize = 133;
+pub const MS_HEADER_TOTAL_LEN: u16 = 97;
 
 pub fn build_config_descriptor(cfg: &UsbDeviceConfig, out: &mut [u8; CONFIG_DESCRIPTOR_LEN]) {
     let ep_out_addr = if cfg.use_ep2_for_out { 0x02 } else { 0x01 };
@@ -97,32 +97,34 @@ pub fn build_config_descriptor(cfg: &UsbDeviceConfig, out: &mut [u8; CONFIG_DESC
 
         // 6. MIDI IN Jacks (External 1, External 2, Embedded 1, Embedded 2)
         // 6.1 External IN Jack 1 (ID 1)
-        6, CS_INTERFACE, 2, 1, 1, 0,
+        6, CS_INTERFACE, 2, 2, 1, 0,
         // 6.2 External IN Jack 2 (ID 2)
-        6, CS_INTERFACE, 2, 1, 2, 0,
+        6, CS_INTERFACE, 2, 2, 2, 0,
         // 6.3 Embedded IN Jack 1 (ID 3, DAW - String Index 4)
-        6, CS_INTERFACE, 2, 2, 3, 4,
+        6, CS_INTERFACE, 2, 1, 3, 4,
         // 6.4 Embedded IN Jack 2 (ID 4, MIDI - String Index 5)
-        6, CS_INTERFACE, 2, 2, 4, 5,
+        6, CS_INTERFACE, 2, 1, 4, 5,
 
         // 7. MIDI OUT Jacks (External 1, External 2, Embedded 1, Embedded 2)
         // 7.1 External OUT Jack 1 (ID 5, source Embedded IN 1 ID 3)
-        9, CS_INTERFACE, 3, 1, 5, 1, 3, 1, 0,
+        9, CS_INTERFACE, 3, 2, 5, 1, 3, 1, 0,
         // 7.2 External OUT Jack 2 (ID 6, source Embedded IN 2 ID 4)
-        9, CS_INTERFACE, 3, 1, 6, 1, 4, 1, 0,
+        9, CS_INTERFACE, 3, 2, 6, 1, 4, 1, 0,
         // 7.3 Embedded OUT Jack 1 (ID 7, source External IN 1 ID 1, DAW - String Index 4)
-        9, CS_INTERFACE, 3, 2, 7, 1, 1, 1, 4,
+        9, CS_INTERFACE, 3, 1, 7, 1, 1, 1, 4,
         // 7.4 Embedded OUT Jack 2 (ID 8, source External IN 2 ID 2, MIDI - String Index 5)
-        9, CS_INTERFACE, 3, 2, 8, 1, 2, 1, 5,
+        9, CS_INTERFACE, 3, 1, 8, 1, 2, 1, 5,
 
         // 8. Endpoints
-        // 8.1 OUT Endpoint Descriptor (7 bytes)
-        7,
+        // 8.1 Standard MIDI OUT Endpoint Descriptor
+        9,
         DESC_ENDPOINT,
         ep_out_addr, // OUT endpoint address (0x01 or 0x02)
         ep_attr,
         64, 0, // Max packet size 64 bytes
-        0,
+        0, // bInterval
+        0, // bRefresh
+        0, // bSynchAddress
 
         // 8.2 Class-Specific MS Bulk OUT Endpoint Descriptor (6 bytes)
         6,
@@ -132,13 +134,15 @@ pub fn build_config_descriptor(cfg: &UsbDeviceConfig, out: &mut [u8; CONFIG_DESC
         3, // Embedded IN Jack 1 (ID 3)
         4, // Embedded IN Jack 2 (ID 4)
 
-        // 8.3 IN Endpoint Descriptor (7 bytes)
-        7,
+        // 8.3 Standard MIDI IN Endpoint Descriptor
+        9,
         DESC_ENDPOINT,
         0x81, // IN endpoint address (0x81 = EP1 IN)
         ep_attr,
         64, 0, // Max packet size 64 bytes
-        0,
+        0, // bInterval
+        0, // bRefresh
+        0, // bSynchAddress
 
         // 8.4 Class-Specific MS Bulk IN Endpoint Descriptor (6 bytes)
         6,
