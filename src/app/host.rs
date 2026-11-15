@@ -6,6 +6,8 @@ use crate::app::daw::DawApp;
 use crate::app::palette_editor::PaletteEditorApp;
 use crate::app::performance::PerformanceApp;
 use crate::app::programmer::ProgrammerApp;
+#[cfg(feature = "remap")]
+use crate::app::remap::RemapApp;
 use crate::app::setup::SetupApp;
 use crate::app::{AftertouchEvent, App, AppId, MidiEvent, SurfaceEvent};
 use crate::sys::led;
@@ -31,6 +33,8 @@ pub struct AppHost {
     daw: DawApp,
     pending_host_switch: Option<AppId>,
     palette_editor: PaletteEditorApp,
+    #[cfg(feature = "remap")]
+    remap: RemapApp,
     #[cfg(feature = "no-setup-btn")]
     setup_hold_ticks: u16,
     #[cfg(feature = "no-setup-btn")]
@@ -52,6 +56,8 @@ impl AppHost {
             daw: DawApp::new(),
             pending_host_switch: None,
             palette_editor: PaletteEditorApp::new(),
+            #[cfg(feature = "remap")]
+            remap: RemapApp::new(),
             previous_app: current,
             #[cfg(feature = "no-setup-btn")]
             setup_hold_ticks: 0,
@@ -72,6 +78,10 @@ impl AppHost {
             AppId::Programmer => &mut self.programmer,
             AppId::Daw => &mut self.daw,
             AppId::PaletteEditor => &mut self.palette_editor,
+            #[cfg(feature = "remap")]
+            AppId::Remap => &mut self.remap,
+            #[cfg(not(feature = "remap"))]
+            AppId::Remap => &mut self.performance,
         }
     }
 

@@ -9,6 +9,8 @@ pub mod host;
 pub mod palette_editor;
 pub mod performance;
 pub mod programmer;
+#[cfg(feature = "remap")]
+pub mod remap;
 pub mod setup;
 
 pub use crate::sys::midi::MidiPort;
@@ -25,4 +27,17 @@ pub enum AppId {
     Programmer,
     Daw,
     PaletteEditor,
+    /// User-defined button remapping (only built with the `remap` feature).
+    Remap,
+}
+
+/// Mode to enter after the boot animation
+/// If stored remap table exists -> Remap
+/// Otherwise -> Performance
+pub fn default_mode() -> AppId {
+    #[cfg(feature = "remap")]
+    if crate::sys::remap::has_stored_table() {
+        return AppId::Remap;
+    }
+    AppId::Performance
 }

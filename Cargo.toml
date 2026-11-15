@@ -63,6 +63,8 @@ default = []
 no-setup-btn = []
 pressure-sensitive = []
 rgb-color = []
+# User-defined button remapping stored in internal flash (STM32F103C8 layout).
+remap = []
 
 launchpad-x = [
   "no-setup-btn",
@@ -171,6 +173,7 @@ launchpad-s = [
 
 launchpad-mini-mk1 = [
   "launchpad-s-and-mini-common",
+  "remap",
 ]
 
 launchpad-s-and-mini-common = [

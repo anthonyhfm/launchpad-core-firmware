@@ -13,6 +13,8 @@ use crate::sys::settings;
 const PERFORMANCE_BUTTON: u8 = 11;
 const PROGRAMMER_BUTTON: u8 = 13;
 const DAW_BUTTON: u8 = 12;
+#[cfg(feature = "remap")]
+const REMAP_BUTTON: u8 = 14;
 const PALETTE_RAINBOW_BUTTON: u8 = 25;
 const CUSTOM_PALETTE_START: u8 = 26;
 const SYSTEM_PALETTE_START: u8 = 15;
@@ -48,7 +50,10 @@ impl InitPage {
     }
 
     pub fn set_current_mode(&mut self, app: AppId) {
-        if matches!(app, AppId::Performance | AppId::Programmer | AppId::Daw) {
+        if matches!(
+            app,
+            AppId::Performance | AppId::Programmer | AppId::Daw | AppId::Remap
+        ) {
             self.current_mode = app;
             self.selected_mode = None;
         }
@@ -92,6 +97,16 @@ impl InitPage {
                 0xff4000
             } else {
                 0x401000
+            },
+        );
+
+        #[cfg(feature = "remap")]
+        led::set(
+            REMAP_BUTTON,
+            if mode == AppId::Remap {
+                0xffff00
+            } else {
+                0x404000
             },
         );
     }
@@ -180,6 +195,11 @@ impl Page for InitPage {
             }
             PROGRAMMER_BUTTON => {
                 self.selected_mode = Some(AppId::Programmer);
+                self.draw_mode_selector();
+            }
+            #[cfg(feature = "remap")]
+            REMAP_BUTTON => {
+                self.selected_mode = Some(AppId::Remap);
                 self.draw_mode_selector();
             }
             #[cfg(feature = "rgb-color")]

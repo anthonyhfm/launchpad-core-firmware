@@ -20,6 +20,11 @@ pub fn execute(app: AppId, port: MidiPort, data: &[u8]) -> bool {
         return true;
     }
 
+    #[cfg(feature = "remap")]
+    if crate::sys::remap::execute(port, data) {
+        return true;
+    }
+
     if device_inquiry::execute(app, port, data) {
         return true;
     }

@@ -67,7 +67,7 @@ impl App for BootApp {
 
     fn on_tick(&mut self) {
         if self.data.len() < 4 {
-            self.requested_switch = Some(AppId::Performance);
+            self.requested_switch = Some(crate::app::default_mode());
             return;
         }
 
@@ -128,7 +128,7 @@ impl App for BootApp {
         }
 
         if self.tick >= end_tick {
-            self.requested_switch = Some(AppId::Performance);
+            self.requested_switch = Some(crate::app::default_mode());
             return;
         }
 
