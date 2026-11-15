@@ -1,0 +1,49 @@
+# Example config for the Launchpad Mini mk1 remap mode.
+# Open in remap-gui.py, then Upload to device.
+#
+# Device limits:
+#   - at most 3 pages (banks); the start page becomes bank 0 (active at power-up)
+#   - actions: note, cc, program, page (no raw "send" bytes)
+#   - output on the "MINI (MIDI)" port
+#   - LED feedback: send the mapped note/CC back to the "MINI (MIDI)" port
+#
+# Top button 5 (top.4) doubles as the setup button: hold 0.5 s to open the
+# setup menu (pad 14 = remap mode). A short press sends its mapping.
+
+[output]
+channel = 1
+
+[behavior]
+start_page = "pads"
+default_color = "green"
+default_off_color = "off"
+middle_c_octave = 4
+
+[colors]
+dim = [1, 0]
+
+[global]
+"top.0" = { page = "pads",  color = "amber", off_color = "amber_low" }
+"top.1" = { page = "keys",  color = "amber", off_color = "amber_low" }
+"top.2" = { page = "mixer", color = "amber", off_color = "amber_low" }
+"top.5" = { cc = 117, color = "green",  off_color = "green_low", label = "play" }
+"top.6" = { cc = 118, color = "red",    off_color = "dim",       label = "record" }
+"top.7" = { cc = 64, mode = "toggle", color = "yellow", off_color = "off", label = "sustain" }
+
+[pages.pads]
+layout = { type = "notes", start = 36, row_step = 8, col_step = 1, channel = 10, color = "red", off_color = "red_low" }
+"side.0" = { program = 0, color = "lime" }
+"side.1" = { program = 1, color = "lime" }
+
+[pages.keys]
+layout = { type = "notes", start = "C2", row_step = 5, col_step = 1, color = "green", off_color = "off" }
+
+[pages.mixer]
+"grid.0.0" = { cc = 20, mode = "toggle", color = "red", off_color = "dim" }
+"grid.0.1" = { cc = 21, mode = "toggle", color = "red", off_color = "dim" }
+"grid.0.2" = { cc = 22, mode = "toggle", color = "red", off_color = "dim" }
+"grid.0.3" = { cc = 23, mode = "toggle", color = "red", off_color = "dim" }
+"grid.0.4" = { cc = 24, mode = "toggle", color = "red", off_color = "dim" }
+"grid.0.5" = { cc = 25, mode = "toggle", color = "red", off_color = "dim" }
+"grid.0.6" = { cc = 26, mode = "toggle", color = "red", off_color = "dim" }
+"grid.0.7" = { cc = 27, mode = "toggle", color = "red", off_color = "dim" }
