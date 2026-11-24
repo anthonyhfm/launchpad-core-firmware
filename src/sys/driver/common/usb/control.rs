@@ -3,8 +3,10 @@
 
 use super::UsbDeviceConfig;
 use super::descriptors::{
-    CONFIG_DESCRIPTOR_LEN, DESC_CONFIGURATION, DESC_DEVICE, DESC_STRING, STRING_LANG_ID,
-    build_config_descriptor, build_device_descriptor, encode_string_descriptor,
+    CONFIG_DESCRIPTOR_LEN, DESC_CONFIGURATION, DESC_DEVICE, DESC_STRING,
+    ENTTEC_CONFIG_DESCRIPTOR_LEN, ENTTEC_MANUFACTURER, ENTTEC_PRODUCT, ENTTEC_SERIAL,
+    STRING_LANG_ID, UsbMode, build_config_descriptor, build_device_descriptor_for_mode,
+    build_enttec_config_descriptor, encode_string_descriptor,
 };
 use core::cell::UnsafeCell;
 
@@ -17,8 +19,24 @@ pub const REQ_SET_CONFIGURATION: u8 = 0x09;
 pub const REQ_GET_INTERFACE: u8 = 0x0a;
 pub const REQ_SET_INTERFACE: u8 = 0x0b;
 
+// FTDI FT232R vendor-specific control requests.
+pub const FTDI_SIO_RESET: u8 = 0x00;
+pub const FTDI_SIO_MODEM_CTRL: u8 = 0x01;
+pub const FTDI_SIO_SET_FLOW_CTRL: u8 = 0x02;
+pub const FTDI_SIO_SET_BAUD_RATE: u8 = 0x03;
+pub const FTDI_SIO_SET_DATA: u8 = 0x04;
+pub const FTDI_SIO_GET_MODEM_STATUS: u8 = 0x05;
+pub const FTDI_SIO_SET_EVENT_CHAR: u8 = 0x06;
+pub const FTDI_SIO_SET_ERROR_CHAR: u8 = 0x07;
+pub const FTDI_SIO_SET_LATENCY_TIMER: u8 = 0x09;
+pub const FTDI_SIO_GET_LATENCY_TIMER: u8 = 0x0a;
+pub const FTDI_SIO_SET_BITMODE: u8 = 0x0b;
+pub const FTDI_SIO_READ_PINS: u8 = 0x0c;
+pub const FTDI_SIO_READ_EEPROM: u8 = 0x90;
+
 pub struct ControlState {
     pub cfg: Option<&'static UsbDeviceConfig>,
+    pub mode: UsbMode,
     pub configuration: u8,
     pub pending_address: Option<u8>,
     pub tx_data: *const u8,
@@ -28,6 +46,8 @@ pub struct ControlState {
     pub control_buf: [u8; 64],
     pub device_desc: [u8; 18],
     pub config_desc: [u8; CONFIG_DESCRIPTOR_LEN],
+    pub config_desc_len: usize,
+    pub ftdi_latency_timer: u8,
     pub inited: bool,
 }
 
@@ -35,6 +55,7 @@ impl ControlState {
     pub const fn new() -> Self {
         Self {
             cfg: None,
+            mode: UsbMode::Midi,
             configuration: 0,
             pending_address: None,
             tx_data: core::ptr::null(),
@@ -44,6 +65,8 @@ impl ControlState {
             control_buf: [0; 64],
             device_desc: [0; 18],
             config_desc: [0; CONFIG_DESCRIPTOR_LEN],
+            config_desc_len: CONFIG_DESCRIPTOR_LEN,
+            ftdi_latency_timer: 16,
             inited: false,
         }
     }
@@ -57,9 +80,26 @@ impl ControlState {
     }
 
     pub fn init(&mut self, cfg: &'static UsbDeviceConfig) {
+        self.init_with_mode(cfg, UsbMode::Midi);
+    }
+
+    pub fn init_with_mode(&mut self, cfg: &'static UsbDeviceConfig, mode: UsbMode) {
         self.cfg = Some(cfg);
-        build_device_descriptor(cfg, &mut self.device_desc);
-        build_config_descriptor(cfg, &mut self.config_desc);
+        self.mode = mode;
+        build_device_descriptor_for_mode(cfg, mode, &mut self.device_desc);
+        match mode {
+            UsbMode::Midi => {
+                build_config_descriptor(cfg, &mut self.config_desc);
+                self.config_desc_len = CONFIG_DESCRIPTOR_LEN;
+            }
+            UsbMode::EnttecDmxPro => {
+                let mut enttec_cfg = [0u8; ENTTEC_CONFIG_DESCRIPTOR_LEN];
+                build_enttec_config_descriptor(cfg, &mut enttec_cfg);
+                self.config_desc[..ENTTEC_CONFIG_DESCRIPTOR_LEN].copy_from_slice(&enttec_cfg);
+                self.config_desc_len = ENTTEC_CONFIG_DESCRIPTOR_LEN;
+            }
+        }
+        self.ftdi_latency_timer = 16;
         self.inited = true;
         self.configuration = 0;
         self.abort_transfer();
@@ -100,11 +140,21 @@ pub fn handle_setup(state: &mut ControlState, setup: [u8; 8]) -> SetupAction {
     let index = u16::from_le_bytes([setup[4], setup[5]]);
     let length = u16::from_le_bytes([setup[6], setup[7]]) as usize;
 
-    if bm_request_type & 0x60 != 0 {
+    let is_device_to_host = (bm_request_type & 0x80) != 0;
+    let req_type = bm_request_type & 0x60;
+
+    if req_type == 0x40 && state.mode == UsbMode::EnttecDmxPro {
+        return handle_ftdi_vendor_request(state, is_device_to_host, request, value, length);
+    }
+
+    if req_type != 0 {
         return SetupAction::Stall;
     }
 
-    let is_device_to_host = (bm_request_type & 0x80) != 0;
+    let max_interface = match state.mode {
+        UsbMode::Midi => 1,
+        UsbMode::EnttecDmxPro => 0,
+    };
 
     match (is_device_to_host, request) {
         (true, REQ_GET_DESCRIPTOR) => {
@@ -116,19 +166,38 @@ pub fn handle_setup(state: &mut ControlState, setup: [u8; 8]) -> SetupAction {
                     (state.device_desc.as_ptr(), state.device_desc.len())
                 }
                 DESC_CONFIGURATION if desc_index == 0 => {
-                    (state.config_desc.as_ptr(), state.config_desc.len())
+                    (state.config_desc.as_ptr(), state.config_desc_len)
                 }
                 DESC_STRING => {
-                    let len = match desc_index {
-                        0 => {
+                    let len = match (state.mode, desc_index) {
+                        (_, 0) => {
                             state.control_buf[..4].copy_from_slice(&STRING_LANG_ID);
                             4
                         }
-                        1 => encode_string_descriptor(cfg.manufacturer, &mut state.control_buf),
-                        2 => encode_string_descriptor(cfg.product, &mut state.control_buf),
-                        3 => encode_string_descriptor(cfg.serial_number, &mut state.control_buf),
-                        4 => encode_string_descriptor(cfg.port1_name, &mut state.control_buf),
-                        5 => encode_string_descriptor(cfg.port2_name, &mut state.control_buf),
+                        (UsbMode::Midi, 1) => {
+                            encode_string_descriptor(cfg.manufacturer, &mut state.control_buf)
+                        }
+                        (UsbMode::Midi, 2) => {
+                            encode_string_descriptor(cfg.product, &mut state.control_buf)
+                        }
+                        (UsbMode::Midi, 3) => {
+                            encode_string_descriptor(cfg.serial_number, &mut state.control_buf)
+                        }
+                        (UsbMode::Midi, 4) => {
+                            encode_string_descriptor(cfg.port1_name, &mut state.control_buf)
+                        }
+                        (UsbMode::Midi, 5) => {
+                            encode_string_descriptor(cfg.port2_name, &mut state.control_buf)
+                        }
+                        (UsbMode::EnttecDmxPro, 1) => {
+                            encode_string_descriptor(ENTTEC_MANUFACTURER, &mut state.control_buf)
+                        }
+                        (UsbMode::EnttecDmxPro, 2) => {
+                            encode_string_descriptor(ENTTEC_PRODUCT, &mut state.control_buf)
+                        }
+                        (UsbMode::EnttecDmxPro, 3) => {
+                            encode_string_descriptor(ENTTEC_SERIAL, &mut state.control_buf)
+                        }
                         _ => return SetupAction::Stall,
                     };
                     (state.control_buf.as_ptr(), len)
@@ -162,11 +231,53 @@ pub fn handle_setup(state: &mut ControlState, setup: [u8; 8]) -> SetupAction {
             start_control_read(state, state.control_buf.as_ptr(), 2, length)
         }
         (false, REQ_CLEAR_FEATURE) => SetupAction::StatusIn,
-        (true, REQ_GET_INTERFACE) if index <= 1 => {
+        (true, REQ_GET_INTERFACE) if index <= max_interface => {
             state.control_buf[0] = 0;
             start_control_read(state, state.control_buf.as_ptr(), 1, length)
         }
-        (false, REQ_SET_INTERFACE) if index <= 1 && value == 0 => SetupAction::StatusIn,
+        (false, REQ_SET_INTERFACE) if index <= max_interface && value == 0 => SetupAction::StatusIn,
+        _ => SetupAction::Stall,
+    }
+}
+
+fn handle_ftdi_vendor_request(
+    state: &mut ControlState,
+    is_device_to_host: bool,
+    request: u8,
+    value: u16,
+    length: usize,
+) -> SetupAction {
+    match (is_device_to_host, request) {
+        (false, FTDI_SIO_RESET)
+        | (false, FTDI_SIO_MODEM_CTRL)
+        | (false, FTDI_SIO_SET_FLOW_CTRL)
+        | (false, FTDI_SIO_SET_BAUD_RATE)
+        | (false, FTDI_SIO_SET_DATA)
+        | (false, FTDI_SIO_SET_EVENT_CHAR)
+        | (false, FTDI_SIO_SET_ERROR_CHAR)
+        | (false, FTDI_SIO_SET_BITMODE) => SetupAction::StatusIn,
+        (false, FTDI_SIO_SET_LATENCY_TIMER) => {
+            state.ftdi_latency_timer = (value & 0xff) as u8;
+            SetupAction::StatusIn
+        }
+        (true, FTDI_SIO_GET_MODEM_STATUS) => {
+            state.control_buf[0] = 0x01;
+            state.control_buf[1] = 0x60;
+            start_control_read(state, state.control_buf.as_ptr(), 2, length)
+        }
+        (true, FTDI_SIO_GET_LATENCY_TIMER) => {
+            state.control_buf[0] = state.ftdi_latency_timer;
+            start_control_read(state, state.control_buf.as_ptr(), 1, length)
+        }
+        (true, FTDI_SIO_READ_PINS) => {
+            state.control_buf[0] = 0x00;
+            start_control_read(state, state.control_buf.as_ptr(), 1, length)
+        }
+        (true, FTDI_SIO_READ_EEPROM) => {
+            state.control_buf[0] = 0xff;
+            state.control_buf[1] = 0xff;
+            start_control_read(state, state.control_buf.as_ptr(), 2, length)
+        }
         _ => SetupAction::Stall,
     }
 }

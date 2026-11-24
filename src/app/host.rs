@@ -11,9 +11,14 @@ use crate::app::{AftertouchEvent, App, AppId, MidiEvent, SurfaceEvent};
 use crate::sys::led;
 use crate::sys::midi::MidiPort;
 use crate::sys::rotation;
-#[cfg(not(feature = "no-setup-btn"))]
+#[cfg(any(not(feature = "no-setup-btn"), feature = "rgb-color"))]
 use crate::sys::settings;
 use crate::sys::sysex::{self, modes};
+#[cfg(feature = "rgb-color")]
+use crate::sys::driver::common::usb::{
+    self, DmxFrame, UsbMode,
+    dmx::{DMX_LED_COUNT, pad_index_to_xy},
+};
 
 const SETUP_HOLD_TICKS: u16 = 500;
 #[cfg(feature = "no-setup-btn")]
@@ -39,6 +44,10 @@ pub struct AppHost {
     setup_button_ticks: u16,
     #[cfg(not(feature = "no-setup-btn"))]
     setup_button_active: bool,
+    #[cfg(feature = "rgb-color")]
+    dmx_frame: DmxFrame,
+    #[cfg(feature = "rgb-color")]
+    dmx_rendered: bool,
 }
 
 impl AppHost {
@@ -61,6 +70,10 @@ impl AppHost {
             setup_button_ticks: 0,
             #[cfg(not(feature = "no-setup-btn"))]
             setup_button_active: false,
+            #[cfg(feature = "rgb-color")]
+            dmx_frame: DmxFrame::empty(),
+            #[cfg(feature = "rgb-color")]
+            dmx_rendered: false,
         }
     }
 
@@ -101,11 +114,68 @@ impl AppHost {
         }
 
         self.active_app_mut().on_enter();
+
+        #[cfg(feature = "rgb-color")]
+        if self.is_dmx_surface_active() {
+            led::clear();
+            self.dmx_rendered = false;
+            self.render_dmx_frame(&self.dmx_frame.clone(), true);
+        }
+    }
+
+    #[cfg(feature = "rgb-color")]
+    fn is_dmx_surface_active(&self) -> bool {
+        usb::current_mode() == UsbMode::EnttecDmxPro
+            && !matches!(
+                self.current,
+                AppId::Boot | AppId::Setup | AppId::PaletteEditor
+            )
+    }
+
+    #[cfg(feature = "rgb-color")]
+    #[inline(never)]
+    pub fn route_dmx_frame(&mut self, frame: &DmxFrame) {
+        if self.is_dmx_surface_active() {
+            self.render_dmx_frame(frame, !self.dmx_rendered);
+        } else {
+            self.dmx_frame = *frame;
+        }
+    }
+
+    #[cfg(feature = "rgb-color")]
+    fn render_dmx_frame(&mut self, frame: &DmxFrame, force_all: bool) {
+        for pad in 0..DMX_LED_COUNT {
+            let base = pad * 3;
+            let r = frame.channels[base] >> 2;
+            let g = frame.channels[base + 1] >> 2;
+            let b = frame.channels[base + 2] >> 2;
+
+            if force_all
+                || (self.dmx_frame.channels[base] >> 2) != r
+                || (self.dmx_frame.channels[base + 1] >> 2) != g
+                || (self.dmx_frame.channels[base + 2] >> 2) != b
+            {
+                led::set_rgb(pad_index_to_xy(pad), r, g, b);
+            }
+        }
+        self.dmx_frame = *frame;
+        self.dmx_rendered = true;
     }
 
     #[inline(never)]
     pub fn route_surface_event(&mut self, event: SurfaceEvent) {
-        if event.index != 0 {
+        let suppress_for_dmx = {
+            #[cfg(feature = "rgb-color")]
+            {
+                self.is_dmx_surface_active()
+            }
+            #[cfg(not(feature = "rgb-color"))]
+            {
+                false
+            }
+        };
+
+        if event.index != 0 && !suppress_for_dmx {
             let mut canonical_event = event;
             canonical_event.index = self.to_canonical_index(event.index);
 
@@ -250,6 +320,11 @@ impl AppHost {
 
     fn exit_setup(&mut self) {
         let selected = self.setup.finish_setup();
+        #[cfg(feature = "rgb-color")]
+        {
+            let target_mode = UsbMode::from_u8(settings::get().usb_mode);
+            usb::set_mode(target_mode);
+        }
         let pending = self.pending_host_switch.take();
         let app = selected.or(pending).unwrap_or(self.previous_app);
         self.switch(app);

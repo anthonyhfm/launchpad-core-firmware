@@ -14,7 +14,39 @@ pub const CS_ENDPOINT: u8 = 0x25;
 
 pub const STRING_LANG_ID: [u8; 4] = [4, DESC_STRING, 0x09, 0x04];
 
+pub const ENTTEC_VENDOR_ID: u16 = 0x0403;
+pub const ENTTEC_PRODUCT_ID: u16 = 0x6001;
+pub const ENTTEC_BCD_DEVICE: u16 = 0x0600;
+pub const ENTTEC_MANUFACTURER: &str = "ENTTEC";
+pub const ENTTEC_PRODUCT: &str = "DMX USB PRO";
+pub const ENTTEC_SERIAL: &str = "EN000001";
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum UsbMode {
+    Midi = 0,
+    EnttecDmxPro = 1,
+}
+
+impl UsbMode {
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::EnttecDmxPro,
+            _ => Self::Midi,
+        }
+    }
+}
+
 pub fn build_device_descriptor(cfg: &UsbDeviceConfig, out: &mut [u8; 18]) {
+    build_device_descriptor_for_mode(cfg, UsbMode::Midi, out);
+}
+
+pub fn build_device_descriptor_for_mode(cfg: &UsbDeviceConfig, mode: UsbMode, out: &mut [u8; 18]) {
+    let (vendor_id, product_id, bcd_device) = match mode {
+        UsbMode::Midi => (cfg.vendor_id, cfg.product_id, cfg.bcd_device),
+        UsbMode::EnttecDmxPro => (ENTTEC_VENDOR_ID, ENTTEC_PRODUCT_ID, ENTTEC_BCD_DEVICE),
+    };
+
     out[0] = 18;
     out[1] = DESC_DEVICE;
     out[2] = 0x00; // bcdUSB 2.0 (0x0200)
@@ -23,12 +55,12 @@ pub fn build_device_descriptor(cfg: &UsbDeviceConfig, out: &mut [u8; 18]) {
     out[5] = 0x00; // SubClass
     out[6] = 0x00; // Protocol
     out[7] = cfg.ep0_max_packet_size;
-    out[8] = (cfg.vendor_id & 0xff) as u8;
-    out[9] = ((cfg.vendor_id >> 8) & 0xff) as u8;
-    out[10] = (cfg.product_id & 0xff) as u8;
-    out[11] = ((cfg.product_id >> 8) & 0xff) as u8;
-    out[12] = (cfg.bcd_device & 0xff) as u8;
-    out[13] = ((cfg.bcd_device >> 8) & 0xff) as u8;
+    out[8] = (vendor_id & 0xff) as u8;
+    out[9] = ((vendor_id >> 8) & 0xff) as u8;
+    out[10] = (product_id & 0xff) as u8;
+    out[11] = ((product_id >> 8) & 0xff) as u8;
+    out[12] = (bcd_device & 0xff) as u8;
+    out[13] = ((bcd_device >> 8) & 0xff) as u8;
     out[14] = 1; // iManufacturer
     out[15] = 2; // iProduct
     out[16] = 3; // iSerialNumber
@@ -36,7 +68,56 @@ pub fn build_device_descriptor(cfg: &UsbDeviceConfig, out: &mut [u8; 18]) {
 }
 
 pub const CONFIG_DESCRIPTOR_LEN: usize = 133;
+pub const ENTTEC_CONFIG_DESCRIPTOR_LEN: usize = 32;
 pub const MS_HEADER_TOTAL_LEN: u16 = 97;
+
+pub fn build_enttec_config_descriptor(
+    cfg: &UsbDeviceConfig,
+    out: &mut [u8; ENTTEC_CONFIG_DESCRIPTOR_LEN],
+) {
+    let max_power = (cfg.max_power_ma / 2).min(255) as u8;
+
+    let desc: [u8; ENTTEC_CONFIG_DESCRIPTOR_LEN] = [
+        // 1. Configuration Descriptor (9 bytes)
+        9,
+        DESC_CONFIGURATION,
+        (ENTTEC_CONFIG_DESCRIPTOR_LEN & 0xff) as u8,
+        ((ENTTEC_CONFIG_DESCRIPTOR_LEN >> 8) & 0xff) as u8,
+        1,    // 1 interface (FTDI FT232R vendor-specific)
+        1,    // bConfigurationValue
+        0,    // iConfiguration
+        0x80, // bmAttributes (Bus Powered)
+        max_power,
+        // 2. Interface Descriptor (9 bytes)
+        9,
+        DESC_INTERFACE,
+        0,    // bInterfaceNumber
+        0,    // bAlternateSetting
+        2,    // bNumEndpoints (EP1 IN + EP2 OUT)
+        0xff, // bInterfaceClass (Vendor Specific)
+        0xff, // bInterfaceSubClass (Vendor Specific)
+        0xff, // bInterfaceProtocol (Vendor Specific)
+        2,    // iInterface (Product string: "DMX USB PRO")
+        // 3. Bulk IN Endpoint Descriptor (EP1 IN = 0x81, 7 bytes)
+        7,
+        DESC_ENDPOINT,
+        0x81, // bEndpointAddress (EP1 IN)
+        0x02, // bmAttributes (Bulk)
+        64,
+        0, // wMaxPacketSize (64 bytes)
+        0, // bInterval
+        // 4. Bulk OUT Endpoint Descriptor (EP2 OUT = 0x02, 7 bytes)
+        7,
+        DESC_ENDPOINT,
+        0x02, // bEndpointAddress (EP2 OUT)
+        0x02, // bmAttributes (Bulk)
+        64,
+        0, // wMaxPacketSize (64 bytes)
+        0, // bInterval
+    ];
+
+    out.copy_from_slice(&desc);
+}
 
 pub fn build_config_descriptor(cfg: &UsbDeviceConfig, out: &mut [u8; CONFIG_DESCRIPTOR_LEN]) {
     let ep_out_addr = if cfg.use_ep2_for_out { 0x02 } else { 0x01 };

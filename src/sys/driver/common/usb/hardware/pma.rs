@@ -3,6 +3,8 @@
 
 use super::super::UsbDeviceConfig;
 use super::super::control::{SetupAction, control, handle_setup_request, next_ep0_chunk};
+use super::super::descriptors::UsbMode;
+use super::super::dmx::{DmxParser, dmx_queues};
 use super::super::midi::{SysexReceiver, parse_usb_midi_packet};
 use super::super::queues::queues;
 use core::cell::UnsafeCell;
@@ -60,12 +62,14 @@ const EP_MAX_PACKET: usize = 64;
 
 struct PmaState {
     sysex_rx: SysexReceiver,
+    dmx_parser: DmxParser,
 }
 
 impl PmaState {
     const fn new() -> Self {
         Self {
             sysex_rx: SysexReceiver::new(),
+            dmx_parser: DmxParser::new(),
         }
     }
 }
@@ -75,18 +79,28 @@ unsafe impl Sync for PmaStateCell {}
 
 static PMA_STATE: PmaStateCell = PmaStateCell(UnsafeCell::new(PmaState::new()));
 
-fn pma_layout(cfg: &UsbDeviceConfig) -> (u16, u16, u16, u16, u16) {
-    if cfg.use_ep2_for_out {
-        // Launchpad S / Mini MK1: EP0 64b, EP1 IN 64b, EP2 OUT 64b
+#[inline(always)]
+fn uses_ep2_out(cfg: &UsbDeviceConfig, mode: UsbMode) -> bool {
+    cfg.use_ep2_for_out || mode == UsbMode::EnttecDmxPro
+}
+
+fn pma_layout(cfg: &UsbDeviceConfig, mode: UsbMode) -> (u16, u16, u16, u16, u16) {
+    if uses_ep2_out(cfg, mode) {
+        // EP0 64b (or 8b), EP1 IN 64b, EP2 OUT 64b
         (0x40, 0x80, 0xc0, 0x00, 0x100)
     } else {
-        // Launchpad MK2 / Pro: EP0 8b, EP1 IN 64b, EP1 OUT 64b
+        // Launchpad MK2 / Pro MIDI: EP0 8b, EP1 IN 64b, EP1 OUT 64b
         (0x40, 0x48, 0x90, 0x50, 0x00)
     }
 }
 
 pub fn init(cfg: &'static UsbDeviceConfig) {
-    control().init(cfg);
+    init_with_mode(cfg, UsbMode::Midi);
+}
+
+pub fn init_with_mode(cfg: &'static UsbDeviceConfig, mode: UsbMode) {
+    cortex_m::peripheral::NVIC::mask(pac::Interrupt::USB_LP_CAN1_RX0);
+    control().init_with_mode(cfg, mode);
 
     pac::RCC.cfgr().modify(|w| {
         w.set_usbpre(pac::rcc::vals::Usbpre::DIV1_5);
@@ -116,6 +130,43 @@ pub fn init(cfg: &'static UsbDeviceConfig) {
         let mut p = cortex_m::Peripherals::steal();
         p.NVIC.set_priority(pac::Interrupt::USB_LP_CAN1_RX0, 0x20); // Priority 2
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USB_LP_CAN1_RX0);
+    }
+}
+
+pub fn reinit_mode(mode: UsbMode) {
+    let (cfg, current) = cortex_m::interrupt::free(|_| {
+        let ctrl = control();
+        (ctrl.cfg, ctrl.mode)
+    });
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if current == mode {
+        return;
+    }
+
+    cortex_m::peripheral::NVIC::mask(pac::Interrupt::USB_LP_CAN1_RX0);
+    unsafe {
+        // Hold USB peripheral in reset and power-down during soft disconnect.
+        write16(USB_CNTR, CNTR_FRES | (1 << 1));
+    }
+
+    #[cfg(any(feature = "launchpad-mk2", feature = "launchpad-pro"))]
+    {
+        // PA10 controls the external USB D+ pull-up on Launchpad MK2 / Pro.
+        pac::GPIOA
+            .brr()
+            .write_value(pac::gpio::regs::Brr(1 << 10));
+        cortex_m::asm::delay(1_800_000);
+        init_with_mode(cfg, mode);
+        pac::GPIOA
+            .bsrr()
+            .write_value(pac::gpio::regs::Bsrr(1 << 10));
+    }
+
+    #[cfg(not(any(feature = "launchpad-mk2", feature = "launchpad-pro")))]
+    {
+        init_with_mode(cfg, mode);
     }
 }
 
@@ -162,19 +213,24 @@ pub fn pump_tx() {
     let Some(cfg) = ctrl.cfg else {
         return;
     };
-    let (_, _, ep1_tx_addr, _, _) = pma_layout(cfg);
+    let (_, _, ep1_tx_addr, _, _) = pma_layout(cfg, ctrl.mode);
 
-    let q = queues();
     let mut payload = [0u8; EP_MAX_PACKET];
-    let mut count = 0;
-
-    while count + 4 <= EP_MAX_PACKET {
-        let Some(packet) = q.midi_tx.pop() else {
-            break;
-        };
-        payload[count..count + 4].copy_from_slice(&packet.data);
-        count += 4;
-    }
+    let count = match ctrl.mode {
+        UsbMode::Midi => {
+            let q = queues();
+            let mut n = 0;
+            while n + 4 <= EP_MAX_PACKET {
+                let Some(packet) = q.midi_tx.pop() else {
+                    break;
+                };
+                payload[n..n + 4].copy_from_slice(&packet.data);
+                n += 4;
+            }
+            n
+        }
+        UsbMode::EnttecDmxPro => dmx_queues().pop_ftdi_in_packet(&mut payload),
+    };
 
     if count > 0 {
         write_ep_tx(EP1, ep1_tx_addr, &payload[..count]);
@@ -189,11 +245,13 @@ unsafe fn reset_bus() {
     let Some(cfg) = ctrl.cfg else {
         return;
     };
-    ctrl.init(cfg);
+    let mode = ctrl.mode;
+    ctrl.init_with_mode(cfg, mode);
 
     reset_transport_session();
 
-    let (ep0_rx_addr, ep0_tx_addr, ep1_tx_addr, ep1_rx_addr, ep2_rx_addr) = pma_layout(cfg);
+    let (ep0_rx_addr, ep0_tx_addr, ep1_tx_addr, ep1_rx_addr, ep2_rx_addr) = pma_layout(cfg, mode);
+    let ep2_out = uses_ep2_out(cfg, mode);
 
     unsafe {
         write16(USB_DADDR, DADDR_EF);
@@ -202,7 +260,7 @@ unsafe fn reset_bus() {
         let ep0_size = cfg.ep0_max_packet_size as usize;
         set_btable(EP0, ep0_tx_addr, 0, ep0_rx_addr, rx_count(ep0_size));
 
-        if cfg.use_ep2_for_out {
+        if ep2_out {
             set_btable(EP1, ep1_tx_addr, 0, 0, 0);
             set_btable(EP2, 0, 0, ep2_rx_addr, rx_count(EP_MAX_PACKET));
 
@@ -220,8 +278,11 @@ unsafe fn reset_bus() {
 
 fn reset_transport_session() {
     queues().clear();
+    dmx_queues().clear();
     unsafe {
-        (*PMA_STATE.0.get()).sysex_rx.reset();
+        let pma = &mut *PMA_STATE.0.get();
+        pma.sysex_rx.reset();
+        pma.dmx_parser.reset();
     }
 }
 
@@ -244,7 +305,9 @@ fn service_ep(ep: usize) {
     let Some(cfg) = ctrl.cfg else {
         return;
     };
-    let (ep0_rx_addr, ep0_tx_addr, _ep1_tx_addr, ep1_rx_addr, ep2_rx_addr) = pma_layout(cfg);
+    let (ep0_rx_addr, ep0_tx_addr, _ep1_tx_addr, ep1_rx_addr, ep2_rx_addr) =
+        pma_layout(cfg, ctrl.mode);
+    let ep2_out = uses_ep2_out(cfg, ctrl.mode);
 
     if reg & EP_CTR_RX != 0 {
         if ep == EP0 {
@@ -262,7 +325,7 @@ fn service_ep(ep: usize) {
                     set_rx_stat(EP0, EP_STAT_VALID);
                 }
             }
-        } else if (ep == EP1 && !cfg.use_ep2_for_out) || (ep == EP2 && cfg.use_ep2_for_out) {
+        } else if (ep == EP1 && !ep2_out) || (ep == EP2 && ep2_out) {
             if ctrl.configuration == 0 {
                 unsafe {
                     clear_ctr(ep, true, true);
@@ -326,7 +389,8 @@ fn process_setup(setup: [u8; 8]) {
     let Some(cfg) = ctrl.cfg else {
         return;
     };
-    let (_, ep0_tx_addr, _, _, _) = pma_layout(cfg);
+    let (_, ep0_tx_addr, _, _, _) = pma_layout(cfg, ctrl.mode);
+    let ep2_out = uses_ep2_out(cfg, ctrl.mode);
 
     match handle_setup_request(setup) {
         SetupAction::SendPacket { data, len } => {
@@ -355,15 +419,15 @@ fn process_setup(setup: [u8; 8]) {
         SetupAction::ConfigurationChanged(cfg_val) => {
             unsafe {
                 reset_data_endpoint(EP1);
-                if cfg.use_ep2_for_out {
+                if ep2_out {
                     reset_data_endpoint(EP2);
                 }
-                let out_ep = if cfg.use_ep2_for_out { EP2 } else { EP1 };
+                let out_ep = if ep2_out { EP2 } else { EP1 };
                 write_pma_u16((out_ep * 8 + 6) as u16, rx_count(EP_MAX_PACKET));
             }
             if cfg_val != 0 {
                 unsafe {
-                    if cfg.use_ep2_for_out {
+                    if ep2_out {
                         set_tx_stat(EP1, EP_STAT_NAK);
                         set_rx_stat(EP2, EP_STAT_VALID);
                     } else {
@@ -393,15 +457,26 @@ fn write_ep0_tx(ep: usize, addr: u16, data: &[u8]) {
 
 fn process_rx_packets(buf: &[u8]) {
     let pma = unsafe { &mut *PMA_STATE.0.get() };
-    let q = queues();
 
-    for chunk in buf.chunks_exact(4) {
-        parse_usb_midi_packet(
-            chunk,
-            &mut pma.sysex_rx,
-            &mut |event| q.midi_rx.push(event),
-            &mut |msg| q.sysex_rx.push(msg),
-        );
+    match control().mode {
+        UsbMode::Midi => {
+            let q = queues();
+            for chunk in buf.chunks_exact(4) {
+                parse_usb_midi_packet(
+                    chunk,
+                    &mut pma.sysex_rx,
+                    &mut |event| q.midi_rx.push(event),
+                    &mut |msg| q.sysex_rx.push(msg),
+                );
+            }
+        }
+        UsbMode::EnttecDmxPro => {
+            let dq = dmx_queues();
+            pma.dmx_parser.parse_into_queues(buf, dq);
+            if !dq.tx_is_empty() {
+                pump_tx();
+            }
+        }
     }
 }
 

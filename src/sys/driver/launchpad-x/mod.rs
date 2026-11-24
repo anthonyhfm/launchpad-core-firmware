@@ -54,14 +54,14 @@ async fn main(_spawner: Spawner) {
 
     let p = embassy_stm32::init(config);
 
-    usb::init_event_queues();
-    usb::init();
-
     let grid = GRID.init(grid::Grid::new());
     let flash = ExtFlash::new(p.SPI2, p.PB13, p.PB15, p.PB14, p.PB12);
     let runtime_driver = RUNTIME_DRIVER.init(runtime::RuntimeDriver::new(grid, flash));
     driver::install(runtime_driver);
     settings::load();
+
+    usb::init_event_queues();
+    usb::init_with_mode(usb::UsbMode::from_u8(settings::get().usb_mode));
 
     let app_host = APP_HOST.init(Mutex::new(AppHost::new(AppId::Boot)));
     app_host.lock().await.init();
@@ -77,6 +77,10 @@ async fn main(_spawner: Spawner) {
 
         while let Some(event) = usb::dequeue_midi_event() {
             app_host_guard.route_midi_event(event);
+        }
+
+        if let Some(frame) = usb::take_dmx_frame() {
+            app_host_guard.route_dmx_frame(&frame);
         }
 
         app_host_guard.route_tick_event();

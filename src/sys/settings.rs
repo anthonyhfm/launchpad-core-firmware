@@ -11,7 +11,7 @@ const SETTINGS_MAGIC: [u8; 6] = *b"COREFW";
 const SETTINGS_CRC_OFFSET: usize = SETTINGS_MAGIC.len();
 const SETTINGS_CRC_SIZE: usize = 4;
 const SETTINGS_DATA_OFFSET: usize = SETTINGS_CRC_OFFSET + SETTINGS_CRC_SIZE;
-const BASIC_SETTINGS_SIZE: usize = 7;
+const BASIC_SETTINGS_SIZE: usize = 8;
 const PALETTE_OFFSET: usize = SETTINGS_DATA_OFFSET + BASIC_SETTINGS_SIZE;
 const CUSTOM_PALETTE_BYTES: usize = 3 * 3 * 128;
 const SETTINGS_WIRE_SIZE: usize = PALETTE_OFFSET + CUSTOM_PALETTE_BYTES;
@@ -31,6 +31,7 @@ pub struct Settings {
     pub aftertouch_curve: u8,
     pub palette: u8,
     pub mirror_enabled: u8,
+    pub usb_mode: u8,
     pub custom_palette: [[[u8; 128]; 3]; 3],
 }
 
@@ -44,6 +45,7 @@ impl Settings {
             aftertouch_curve: 0,
             palette: 0,
             mirror_enabled: 0,
+            usb_mode: 0,
             custom_palette: [[[0; 128]; 3]; 3],
         }
     }
@@ -57,6 +59,7 @@ impl Settings {
             aftertouch_curve: 0,
             palette: 0,
             mirror_enabled: 0,
+            usb_mode: 0,
             custom_palette: [[[0; 128]; 3]; 3],
         }
     }
@@ -82,6 +85,13 @@ impl Settings {
         }
         if self.mirror_enabled > 1 {
             self.mirror_enabled = 0;
+        }
+        if self.usb_mode > 1 {
+            self.usb_mode = 0;
+        }
+        #[cfg(not(feature = "rgb-color"))]
+        {
+            self.usb_mode = 0;
         }
     }
 
@@ -123,6 +133,7 @@ impl Settings {
         out[SETTINGS_DATA_OFFSET + 4] = self.aftertouch_curve;
         out[SETTINGS_DATA_OFFSET + 5] = self.palette;
         out[SETTINGS_DATA_OFFSET + 6] = self.mirror_enabled;
+        out[SETTINGS_DATA_OFFSET + 7] = self.usb_mode;
 
         let mut pos = PALETTE_OFFSET;
         for slot in self.custom_palette {
@@ -146,6 +157,7 @@ impl Settings {
         settings.aftertouch_curve = input[SETTINGS_DATA_OFFSET + 4];
         settings.palette = input[SETTINGS_DATA_OFFSET + 5];
         settings.mirror_enabled = input[SETTINGS_DATA_OFFSET + 6];
+        settings.usb_mode = input[SETTINGS_DATA_OFFSET + 7];
 
         if input.len() >= SETTINGS_WIRE_SIZE {
             let mut pos = PALETTE_OFFSET;

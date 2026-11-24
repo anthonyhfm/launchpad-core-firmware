@@ -21,3 +21,7 @@ pub const USB_CONFIG: UsbDeviceConfig = UsbDeviceConfig {
 pub fn init() {
     crate::sys::driver::common::usb::init(&USB_CONFIG);
 }
+
+pub fn init_with_mode(mode: UsbMode) {
+    crate::sys::driver::common::usb::init_with_mode(&USB_CONFIG, mode);
+}

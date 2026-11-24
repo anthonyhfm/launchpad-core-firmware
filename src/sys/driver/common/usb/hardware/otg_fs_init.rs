@@ -43,7 +43,7 @@ pub(super) fn wait_until(error: Error, mut ready: impl FnMut() -> bool) -> Resul
     Err(error)
 }
 
-fn delay_ms(ms: u32) {
+pub(super) fn delay_ms(ms: u32) {
     cortex_m::asm::delay(CORE_HZ / 1_000 * ms);
 }
 
