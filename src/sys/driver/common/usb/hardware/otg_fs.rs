@@ -5,6 +5,8 @@ use super::super::UsbDeviceConfig;
 use super::super::control::{
     Ep0InCompletion, SetupAction, complete_ep0_in, control, handle_setup_request,
 };
+use super::super::descriptors::UsbMode;
+use super::super::dmx::{DmxParser, dmx_queues};
 use super::super::midi::{SysexReceiver, parse_usb_midi_packet};
 use super::super::queues::queues;
 use core::cell::UnsafeCell;
@@ -32,6 +34,7 @@ fn fail_hardware(error: HardwareError) {
 
 struct OtgFsState {
     sysex_rx: SysexReceiver,
+    dmx_parser: DmxParser,
     pending_setup: Option<[u8; 8]>,
     ep0_status_in: bool,
 }
@@ -40,6 +43,7 @@ impl OtgFsState {
     const fn new() -> Self {
         Self {
             sysex_rx: SysexReceiver::new(),
+            dmx_parser: DmxParser::new(),
             pending_setup: None,
             ep0_status_in: false,
         }
@@ -51,14 +55,28 @@ unsafe impl Sync for OtgFsStateCell {}
 
 static OTG_STATE: OtgFsStateCell = OtgFsStateCell(UnsafeCell::new(OtgFsState::new()));
 
+#[inline(always)]
+fn out_ep() -> usize {
+    match control().mode {
+        UsbMode::Midi => 1,
+        UsbMode::EnttecDmxPro => 2,
+    }
+}
+
 pub fn init(cfg: &'static UsbDeviceConfig) {
+    init_with_mode(cfg, UsbMode::Midi);
+}
+
+pub fn init_with_mode(cfg: &'static UsbDeviceConfig, mode: UsbMode) {
     cortex_m::peripheral::NVIC::mask(pac::Interrupt::OTG_FS);
     READY.store(false, Ordering::Release);
     LAST_ERROR.store(0, Ordering::Relaxed);
-    control().init(cfg);
+    control().init_with_mode(cfg, mode);
     queues().clear();
+    dmx_queues().clear();
     let state = unsafe { &mut *OTG_STATE.0.get() };
     state.sysex_rx.reset();
+    state.dmx_parser.reset();
     state.pending_setup = None;
     state.ep0_status_in = false;
 
@@ -76,6 +94,27 @@ pub fn init(cfg: &'static UsbDeviceConfig) {
     unsafe {
         cortex_m::peripheral::NVIC::unmask(pac::Interrupt::OTG_FS);
     }
+}
+
+pub fn reinit_mode(mode: UsbMode) {
+    let (cfg, current) = cortex_m::interrupt::free(|_| {
+        let ctrl = control();
+        (ctrl.cfg, ctrl.mode)
+    });
+    let Some(cfg) = cfg else {
+        return;
+    };
+    if current == mode && READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    cortex_m::peripheral::NVIC::mask(pac::Interrupt::OTG_FS);
+    READY.store(false, Ordering::Release);
+    let otg = pac::USB_OTG_FS;
+    otg.gahbcfg().modify(|w| w.set_gint(false));
+    otg.dctl().modify(|w| w.set_sdis(true));
+    initialization::delay_ms(25);
+    init_with_mode(cfg, mode);
 }
 
 pub fn poll() {
@@ -148,10 +187,13 @@ fn reset_core() -> Result<(), HardwareError> {
     let Some(cfg) = control().cfg else {
         return Ok(());
     };
-    control().init(cfg);
+    let mode = control().mode;
+    control().init_with_mode(cfg, mode);
     queues().clear();
+    dmx_queues().clear();
     let state = unsafe { &mut *OTG_STATE.0.get() };
     state.sysex_rx.reset();
+    state.dmx_parser.reset();
     state.pending_setup = None;
     state.ep0_status_in = false;
 
@@ -243,21 +285,33 @@ fn service_rx_fifo() -> Result<(), HardwareError> {
                     rem.copy_from_slice(&data.to_ne_bytes()[..rem.len()]);
                 }
 
-                if ep_num == 1 && control().configuration != 0 {
+                let data_out_ep = out_ep();
+                if ep_num == data_out_ep && control().configuration != 0 {
                     let state = unsafe { &mut *OTG_STATE.0.get() };
-                    let q = queues();
-                    for chunk in buf[..len].chunks_exact(4) {
-                        parse_usb_midi_packet(
-                            chunk,
-                            &mut state.sysex_rx,
-                            &mut |event| q.midi_rx.push(event),
-                            &mut |msg| q.sysex_rx.push(msg),
-                        );
+                    match control().mode {
+                        UsbMode::Midi => {
+                            let q = queues();
+                            for chunk in buf[..len].chunks_exact(4) {
+                                parse_usb_midi_packet(
+                                    chunk,
+                                    &mut state.sysex_rx,
+                                    &mut |event| q.midi_rx.push(event),
+                                    &mut |msg| q.sysex_rx.push(msg),
+                                );
+                            }
+                        }
+                        UsbMode::EnttecDmxPro => {
+                            let dq = dmx_queues();
+                            state.dmx_parser.parse_into_queues(&buf[..len], dq);
+                            if !dq.tx_is_empty() {
+                                pump_tx();
+                            }
+                        }
                     }
                 }
             }
             pac::otg::vals::Pktstsd::OUT_DATA_DONE => {
-                if ep_num == 1 {
+                if ep_num == out_ep() {
                     resume_rx();
                 }
             }
@@ -275,15 +329,16 @@ fn service_rx_fifo() -> Result<(), HardwareError> {
 
 fn resume_rx() {
     let otg = pac::USB_OTG_FS;
-    if control().configuration == 0 || otg.doepctl(1).read().epena() {
+    let ep = out_ep();
+    if control().configuration == 0 || otg.doepctl(ep).read().epena() {
         return;
     }
 
-    otg.doeptsiz(1).write(|w| {
+    otg.doeptsiz(ep).write(|w| {
         w.set_pktcnt(1);
         w.set_xfrsiz(EP_MAX_PACKET as u32);
     });
-    otg.doepctl(1).modify(|w| {
+    otg.doepctl(ep).modify(|w| {
         w.set_cnak(true);
         w.set_epena(true);
     });
@@ -341,9 +396,10 @@ fn service_out_endpoints() -> Result<(), HardwareError> {
             arm_ep0_setup();
         }
     }
-    if daint.oepint() & 2 != 0 {
-        let ep_ints = otg.doepint(1).read();
-        otg.doepint(1).write_value(ep_ints);
+    let ep = out_ep();
+    if daint.oepint() & (1 << ep) != 0 {
+        let ep_ints = otg.doepint(ep).read();
+        otg.doepint(ep).write_value(ep_ints);
     }
     Ok(())
 }
@@ -380,11 +436,12 @@ fn process_setup(setup: [u8; 8]) -> Result<(), HardwareError> {
                     w.set_usbaep(true);
                 });
 
-                otg.doeptsiz(1).write(|w| {
+                let ep = out_ep();
+                otg.doeptsiz(ep).write(|w| {
                     w.set_pktcnt(1);
                     w.set_xfrsiz(64);
                 });
-                otg.doepctl(1).write(|w| {
+                otg.doepctl(ep).write(|w| {
                     w.set_mpsiz(64);
                     w.set_eptyp(pac::otg::vals::Eptyp::BULK);
                     w.set_sd0pid_sevnfrm(true);
@@ -395,7 +452,7 @@ fn process_setup(setup: [u8; 8]) -> Result<(), HardwareError> {
 
                 otg.daintmsk().write(|w| {
                     w.set_iepm(3);
-                    w.set_oepm(3);
+                    w.set_oepm(1 | (1 << ep));
                 });
                 pump_tx();
             } else {
@@ -426,32 +483,36 @@ fn stop_in_endpoint(ep: usize) -> Result<(), HardwareError> {
 
 fn deconfigure_data_endpoints() -> Result<(), HardwareError> {
     let otg = pac::USB_OTG_FS;
+    let ep = out_ep();
     stop_in_endpoint(1)?;
-    if otg.doepctl(1).read().epena() {
+    if otg.doepctl(ep).read().epena() {
         otg.dctl().modify(|w| w.set_sgonak(true));
         let mut budget = initialization::POLL_LIMIT;
         while !otg.gintsts().read().goutnakeff() {
             budget = budget.checked_sub(1).ok_or(HardwareError::OutNak)?;
             service_rx_fifo()?;
         }
-        otg.doepint(1).write(|w| w.set_epdisd(true));
-        if otg.doepctl(1).read().epena() {
-            otg.doepctl(1).modify(|w| w.set_snak(true));
-            otg.doepctl(1).modify(|w| w.set_epdis(true));
+        otg.doepint(ep).write(|w| w.set_epdisd(true));
+        if otg.doepctl(ep).read().epena() {
+            otg.doepctl(ep).modify(|w| w.set_snak(true));
+            otg.doepctl(ep).modify(|w| w.set_epdis(true));
             initialization::wait_until(HardwareError::OutDisable, || {
-                !otg.doepctl(1).read().epena()
+                !otg.doepctl(ep).read().epena()
             })?;
         }
         otg.dctl().modify(|w| w.set_cgonak(true));
     }
     otg.diepctl(1).write(|w| w.set_snak(true));
-    otg.doepctl(1).write(|w| w.set_snak(true));
+    otg.doepctl(ep).write(|w| w.set_snak(true));
     initialization::flush_tx(1)?;
     service_rx_fifo()?;
     otg.diepint(1).write(|w| w.0 = 0xffff_ffff);
-    otg.doepint(1).write(|w| w.0 = 0xffff_ffff);
+    otg.doepint(ep).write(|w| w.0 = 0xffff_ffff);
     queues().clear();
-    unsafe { &mut *OTG_STATE.0.get() }.sysex_rx.reset();
+    dmx_queues().clear();
+    let state = unsafe { &mut *OTG_STATE.0.get() };
+    state.sysex_rx.reset();
+    state.dmx_parser.reset();
     Ok(())
 }
 
@@ -501,17 +562,22 @@ pub fn pump_tx() {
         return;
     }
 
-    let q = queues();
     let mut payload = [0u8; EP_MAX_PACKET];
-    let mut count = 0;
-
-    while count + 4 <= EP_MAX_PACKET {
-        let Some(packet) = q.midi_tx.pop() else {
-            break;
-        };
-        payload[count..count + 4].copy_from_slice(&packet.data);
-        count += 4;
-    }
+    let count = match ctrl.mode {
+        UsbMode::Midi => {
+            let q = queues();
+            let mut n = 0;
+            while n + 4 <= EP_MAX_PACKET {
+                let Some(packet) = q.midi_tx.pop() else {
+                    break;
+                };
+                payload[n..n + 4].copy_from_slice(&packet.data);
+                n += 4;
+            }
+            n
+        }
+        UsbMode::EnttecDmxPro => dmx_queues().pop_ftdi_in_packet(&mut payload),
+    };
 
     if count > 0 {
         otg.dieptsiz(1).write(|w| {

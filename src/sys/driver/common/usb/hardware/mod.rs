@@ -15,7 +15,7 @@ pub mod pma;
     feature = "launchpad-mk2",
     feature = "launchpad-pro"
 ))]
-pub use pma::{init, poll, pump_tx};
+pub use pma::{init, init_with_mode, poll, pump_tx, reinit_mode};
 
 #[cfg(any(
     feature = "launchpad-mini-mk3",
@@ -29,4 +29,4 @@ pub mod otg_fs;
     feature = "launchpad-x",
     feature = "launchpad-pro-mk3"
 ))]
-pub use otg_fs::{init, poll, pump_tx};
+pub use otg_fs::{init, init_with_mode, poll, pump_tx, reinit_mode};

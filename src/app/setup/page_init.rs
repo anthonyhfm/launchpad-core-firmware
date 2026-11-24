@@ -13,6 +13,8 @@ use crate::sys::settings;
 const PERFORMANCE_BUTTON: u8 = 11;
 const PROGRAMMER_BUTTON: u8 = 13;
 const DAW_BUTTON: u8 = 12;
+#[cfg(feature = "rgb-color")]
+const USB_MODE_BUTTON: u8 = 21;
 const PALETTE_RAINBOW_BUTTON: u8 = 25;
 const CUSTOM_PALETTE_START: u8 = 26;
 const SYSTEM_PALETTE_START: u8 = 15;
@@ -144,6 +146,15 @@ impl InitPage {
     }
 
     #[cfg(feature = "rgb-color")]
+    fn draw_usb_mode_toggle(&self) {
+        let dmx_mode = settings::get().usb_mode != 0;
+        led::set(
+            USB_MODE_BUTTON,
+            if dmx_mode { 0x00ffff } else { 0x102030 },
+        );
+    }
+
+    #[cfg(feature = "rgb-color")]
     fn set_palette(&mut self, palette: u8) {
         ensure_custom_palette_has_template(palette);
 
@@ -161,6 +172,8 @@ impl Page for InitPage {
         self.text.draw();
         led::set(57, 0x100000);
         self.draw_mode_selector();
+        #[cfg(feature = "rgb-color")]
+        self.draw_usb_mode_toggle();
         self.draw_palette_selector();
     }
 
@@ -181,6 +194,13 @@ impl Page for InitPage {
             PROGRAMMER_BUTTON => {
                 self.selected_mode = Some(AppId::Programmer);
                 self.draw_mode_selector();
+            }
+            #[cfg(feature = "rgb-color")]
+            USB_MODE_BUTTON => {
+                settings::update(|s| {
+                    s.usb_mode = if s.usb_mode != 0 { 0 } else { 1 };
+                });
+                self.draw_usb_mode_toggle();
             }
             #[cfg(feature = "rgb-color")]
             15..=18 => self.set_palette(event.index - SYSTEM_PALETTE_START),

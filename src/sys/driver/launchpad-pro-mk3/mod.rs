@@ -99,7 +99,7 @@ async fn main(_spawner: Spawner) {
     }
 
     usb::init_event_queues();
-    usb::init();
+    usb::init_with_mode(usb::UsbMode::from_u8(settings::get().usb_mode));
 
     let app_host = AppHost::new(AppId::Boot);
     let app_host = APP_HOST.init(embassy_sync::mutex::Mutex::new(app_host));
@@ -118,6 +118,11 @@ async fn main(_spawner: Spawner) {
             while let Some(event) = usb::dequeue_midi_event() {
                 app_host_guard.route_midi_event(event);
             }
+        }
+
+        if let Some(frame) = usb::take_dmx_frame() {
+            let mut app_host_guard = app_host.lock().await;
+            app_host_guard.route_dmx_frame(&frame);
         }
 
         runtime_driver.leds_task();
